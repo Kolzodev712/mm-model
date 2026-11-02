@@ -188,6 +188,7 @@ just build
 just run
 just docker-build
 just docker-run
+just docker-up
 ```
 
 `just run` uses `./data` unless `MM_DATA_ROOT` is set. The container image
@@ -197,9 +198,20 @@ sets `MM_DATA_ROOT=/data` and expects the host directory mounted there:
 docker run --rm -v ./data:/data mm-model
 ```
 
+Compose runs that same image. It publishes no ports, drops all capabilities,
+and mounts `./data` at `/data`:
+
+```text
+docker compose up --build
+just docker-up
+```
+
+The process exits when the configured run ends, and Compose does not restart
+it. `just docker-down` removes the container and leaves `./data` on the host.
+
 The image is non-root, has no compiler, and opens no inbound port. Historical
 data is not copied into the image. The mounted directory must be writable by
-uid 10001.
+uid 10001 when the configured mode records or trains.
 
 ```text
 just fmt

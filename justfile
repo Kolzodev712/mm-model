@@ -31,3 +31,12 @@ docker-build:
 docker-run:
     mkdir -p data
     docker run --rm -v "{{justfile_directory()}}/data:/data" mm-model
+
+# Build and run the same image through Compose. The container exits when the configured run ends.
+docker-up:
+    mkdir -p data
+    docker compose up --build
+
+# Remove the Compose container. The host data directory is left in place.
+docker-down:
+    docker compose down

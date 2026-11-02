@@ -1,0 +1,17 @@
+# Experimental runner. The mode is selected in src/bin/mm_model.rs.
+# The container opens no inbound ports and stores nothing inside the image.
+
+services:
+  mm-model:
+    build: .
+    image: mm-model:latest
+    user: "10001:10001"
+    environment:
+      MM_DATA_ROOT: /data
+    volumes:
+      - ./data:/data
+    restart: "no"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
