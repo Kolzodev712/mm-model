@@ -1,51 +1,151 @@
 # Market-making quote baselines
 
-This repository is a study bench for buy-quote scoring. It is not an optimal
-quoting system and it does not trade.
+This repository is an experimental study bench for buy-quote scoring. It is
+not an optimal quoting system, it does not send orders, and passing tests
+does not make it production-ready.
+
+The executable has one composition root, `src/bin/mm_model.rs`. Change the
+experiment by editing `configuration()`. There is no CLI parser.
 
 ```text
-                  Binance
-                     |
-                     v
-             BinanceBookClient
-                     |
-                     v
-                BookRecord
-                     |
-                     v
-            FairValueMethod
-                     |
-                     v
-                MarketState
-                     |
-              CandidateGenerator
-                     |
-           +---------+---------+
-           |                   |
-           v                   v
-     Logistic model       Linear model
-       P(fill|X)         E[P&L|fill,X]
-           |                   |
-           +---------+---------+
-                     |
-                     v
-              Expected Value
-                     |
-                     v
-              select / NoQuote
-                     |
-                     v
-             SHADOW LOG ONLY
+Collect
+Train
+CollectAndTrain
+Shadow
 ```
 
-No orders are sent. No realized P&L is measured. Public order-book data does
-not provide fill labels for hypothetical quotes. Demo-model output is not
-trading-valid.
+Those are typed `RunMode` values, not commands.
 
-## What is deterministic
+## Pipeline
 
-The historical baseline in `domain`, `evaluation`, and `selection` still
-aggregates quotes that were actually submitted:
+```text
+                   Binance
+                      |
+                      v
+                 Collector
+                      |
+                      v
+                 Raw MMBK
+                      |
+               rotate / close
+                      |
+                      v
+                  Converter
+                      |
+                      v
+              Published Parquet
+                      |
+                 +----+----+
+                 |         |
+                 v         v
+              Trainer   Analysis
+                 |
+                 v
+             Model Artifact
+                 |
+                 v
+               Shadow
+```
+
+```text
+X
+ |
+ +-------------------+
+ |                   |
+ v                   v
+Fill Model         P&L Model
+P(fill | X)        E[P&L | fill, X]
+ |                   |
+ +---------+---------+
+           |
+           v
+EV = probability * conditional P&L
+           |
+           v
+candidate selection
+           |
+           v
+Quote / NoQuote
+```
+
+## Source of truth
+
+```text
+MMBK = raw source of truth
+
+Parquet books = derived historical analytical representation
+
+Training examples = derived labels and features
+
+Model artifact = derived from a specific training dataset and configuration
+```
+
+Raw capture is append-only and partitioned by UTC hour:
+
+```text
+data/raw/binance/BTCUSDT/2026-11-02/13.mmbk
+```
+
+Closed hours are converted in a batch to ZSTD Parquet under `data/books/`.
+A corrupt or outdated Parquet file is rebuilt from MMBK. Parquet is not the
+only copy of captured books.
+
+The catalog is `data/manifest.json`, rewritten through a temporary file and
+`rename`. A partition moves through:
+
+```text
+Open -> Closed -> Validated -> Converted -> Published
+```
+
+`Failed` is terminal for that attempt. Training reads `Published` partitions
+only. The open hour is never trained.
+
+Public Binance books do not contain fill labels for hypothetical quotes.
+Training requires observed quote/fill records or explicitly simulated labels.
+`LabelProvenance` keeps those apart. This pipeline does not invent fills from
+price paths.
+
+## Layout
+
+```text
+domain    prices, books, quotes, outcomes
+model     fair value, features, logistic fill, linear P&L, selection, artifacts
+data      exchange intake, training rows, historical baseline, synthetic demo rows
+storage   MMBK, manifest, Parquet
+runtime   collect, convert, train, shadow, orchestration
+bin       configuration and startup only
+```
+
+Dependencies point inward: domain knows nothing about files or sockets. The
+model does not know about Binance or Parquet. Training reads books through
+`HistoricalBooks`.
+
+## Modes
+
+`Collect` writes raw partitions and publishes Parquet. It does not fit a model.
+
+`Train` reads published Parquet inside the configured window and writes an
+artifact when the reference fit reduces loss and sees at least one fill. It
+does not open a websocket.
+
+`CollectAndTrain` collects, converts each closed hour, and fits after every
+newly published partition (`TrainingTrigger::EveryPublishedPartitions`).
+Collection and training are separate functions. In this build they run on one
+thread, so collection pauses during conversion and training. A failed
+conversion marks that partition `Failed` and collection continues. A failed
+fit keeps the previous artifact. A manifest that cannot be saved stops the
+state change.
+
+`Shadow` scores the live book and logs a quote or `NoQuote`. It does not write
+partitions, send orders, or change weights. The default configuration uses the
+synthetic demo model and prints `DEMO MODEL — predictions are not trading-valid`.
+
+A newly trained artifact is available for later shadow experiments only when
+validation passes. That is not a trading approval.
+
+## Math that stayed
+
+Historical EV, for quotes that were actually submitted:
 
 ```text
 P(fill) = fills / attempts
@@ -53,107 +153,79 @@ pnl = (fair_value_at_horizon - execution_price) * quantity - fees
 EV = P(fill) * average filled P&L
 ```
 
-`HistoricalObservation` still stores a horizon price the caller already has.
-That path is the legacy benchmark. The learned dataset builder does not use it.
+Unfilled attempts contribute 0. The conditional average is absent when there
+are no fills. `NoQuote` has EV 0. The highest finite EV above 0 wins. Ties
+keep the smaller id.
 
-`NoQuote` has EV 0. The highest finite EV above 0 wins. Learned candidates use
-the same rule through `select_learned`, with a copyable `CandidateId` instead
-of a heap string.
-
-Reference price is also deterministic. `FairValueMethod::Microprice` is the
-default:
+`FairValueMethod::Microprice` is the default:
 
 ```text
 (P_ask * Q_bid + P_bid * Q_ask) / (Q_bid + Q_ask)
 ```
 
 Midpoint is `(P_bid + P_ask) / 2`. Both reject empty, non-finite, non-positive,
-and locked or crossed books. They do not return 0 and microprice does not fall
-back to midpoint. This price is an exchange-implied reference from the same
-Binance touch used by the features. It is not an independent fair value.
+and locked or crossed books. They do not return 0, and microprice does not
+fall back to midpoint.
 
-## What is learned
-
-Feature schema v1 has five decision-time ratios:
-
-| Index | Name | Formula |
-| --- | --- | --- |
-| 0 | `quote_distance_from_fair` | `(fair - quote_price) / fair` |
-| 1 | `exchange_spread` | `(best_ask - best_bid) / fair` |
-| 2 | `quote_distance_from_best_bid` | `(quote_price - best_bid) / fair` |
-| 3 | `top_quantity_imbalance` | `(bid_qty - ask_qty) / (bid_qty + ask_qty)` |
-| 4 | `relative_candidate_quantity` | `candidate_quantity / (bid_qty + ask_qty)` |
-
+Feature schema v1 has five decision-time ratios, including candidate quantity.
 Logistic regression predicts fill probability. Linear regression predicts
-conditional P&L. Expected value is the product, outside either model. A
-non-finite score is an error. NaN is not turned into 0.5 and an invalid
-probability is not clamped.
-
-Training is offline. A model artifact records the schema version, fair-value
-method, horizon, and weights. A run refuses a file that does not match.
-Observed and simulated labels cannot be trained together.
+conditional P&L. The product is outside either model. A non-finite score is an
+error. NaN is not turned into 0.5.
 
 Dataset alignment uses the latest valid book at or before the decision and the
-first valid book at or after `t + H`. Rows are rejected when the decision book
-is older than `max_decision_staleness` or the horizon book is later than
-`max_horizon_slippage`. Timestamp gaps use checked arithmetic.
+first valid book at or after `t + H`, with staleness and slippage limits.
+Timestamp gaps use checked arithmetic.
 
-## What is live market data
+The reference trainers are full-batch gradient descent on one materialized
+sample slice. Storage can scan one partition at a time. The trainer is not yet
+a streaming or minibatch algorithm, and it is not suitable for an arbitrarily
+large history. The binary configuration chooses the training window.
 
-`record_book` appends Binance spot partial depth (top 10, 100 ms by default)
-to a fixed 384-byte `MMBK` log. The symbol and endpoint are client
-configuration. BTCUSDT is only the example default. The writer flushes every
-N records and does not fsync each update, so a crash can drop the last batch.
-
-`mm-shadow` reads the same public stream, derives the reference price,
-scores a fixed basis-point candidate grid, and logs predictions for a bounded
-duration. It does not submit orders, update weights, or claim fills.
+## Run
 
 ```text
-just shadow --duration 60s --report-every 5s --symbol BTCUSDT --demo-model
+just build
+just run
+just docker-build
+just docker-run
 ```
 
-`--demo-model` trains a deterministic simulated sample at startup and prints
-`DEMO MODEL — predictions are not trading-valid`. `--model ./models/btc.json`
-loads a previously written artifact. One of those two flags is required.
-There is no silent fallback.
-
-A model file can be mounted read-only:
+`just run` uses `./data` unless `MM_DATA_ROOT` is set. The container image
+sets `MM_DATA_ROOT=/data` and expects the host directory mounted there:
 
 ```text
-docker run --rm -v ./models:/models:ro mm-model-shadow \
-  --duration 5m --report-every 10s --symbol BTCUSDT --model /models/btc.json
+docker run --rm -v ./data:/data mm-model
 ```
 
-## Development
+The image is non-root, has no compiler, and opens no inbound port. Historical
+data is not copied into the image. The mounted directory must be writable by
+uid 10001.
 
 ```text
-./scripts/install-just.sh
 just fmt
 just clippy
 just tests
 just check
-just docker-build
-just docker-shadow --duration 60s --report-every 5s --symbol BTCUSDT --demo-model
 ```
+
+Tests do not open a network connection.
 
 Library features:
 
-| Feature | Dependencies | Used by |
+| Feature | Dependencies | Role |
 | --- | --- | --- |
-| `live` | `tungstenite`, `rustls` (ring) | Binance websocket client, `record_book`, `mm-shadow` |
-| `cli` | `clap` | both binaries |
-| `observe` | `tracing`, `tracing-subscriber`, `signal-hook` | `mm-shadow` logs and SIGINT/SIGTERM |
-| `artifact` | `serde`, `serde_json` | model file load/save |
+| `live` | `tungstenite`, `rustls` | Binance websocket client |
+| `observe` | `tracing`, `tracing-subscriber`, `signal-hook` | runtime logs and SIGINT/SIGTERM |
+| `artifact` | `serde`, `serde_json` | model files and the manifest |
+| `parquet-storage` | Arrow Parquet, ZSTD | derived book files; implies `artifact` |
 
-The default library build has no websocket, CLI, or JSON dependency.
-Inference after startup does not allocate: fair value, candidate fill,
-feature extraction, both predictions, the EV product, and learned selection
-use stack buffers supplied by the caller. Networking, logging, training, and
-artifact load may allocate.
+The default library build does not compile the websocket client or Parquet.
+Inference after startup does not allocate: fair value, candidates, features,
+both predictions, the EV product, and learned selection use stack buffers.
+Capture, conversion, training, and artifact IO may allocate.
 
 ## Not in this repository
 
 Order entry, private exchange APIs, inventory, online learning, neural nets,
-multi-venue fair value, and a risk engine. A fill at one price still does not
-prove that a different price would have filled.
+multi-venue fair value, a risk engine, and a database. A fill at one price
+still does not prove that a different price would have filled.

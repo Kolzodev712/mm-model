@@ -15,18 +15,19 @@ tests:
 # Format, lint, and test.
 check: fmt clippy tests
 
-# Run the read-only book recorder. Example: just record books.mmbk --symbol BTCUSDT
-record *args:
-    cargo run --bin record_book --features "live,cli" -- {{args}}
+# Build the experimental binary. The mode is selected in src/bin/mm_model.rs.
+build:
+    cargo build --bin mm_model --features "live,observe,artifact,parquet-storage"
 
-# Run the shadow inference harness. No orders are sent.
-shadow *args:
-    cargo run --bin mm-shadow --features "live,cli,observe,artifact" -- {{args}}
+# Run that binary. Edit configuration() to change the experiment.
+run:
+    cargo run --bin mm_model --features "live,observe,artifact,parquet-storage"
 
-# Build the shadow-runner image.
+# Build the runtime image. It does not contain historical data.
 docker-build:
-    docker build -t mm-model-shadow .
+    docker build -t mm-model .
 
-# Run the shadow image. Example: just docker-shadow --duration 60s --report-every 5s --demo-model
-docker-shadow *args:
-    docker run --rm mm-model-shadow {{args}}
+# Run the image with a host data directory. No CLI arguments.
+docker-run:
+    mkdir -p data
+    docker run --rm -v "{{justfile_directory()}}/data:/data" mm-model
