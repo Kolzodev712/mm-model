@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "data_root": "./data",
+  "market": {
+    "exchange": "binance_spot",
+    "symbol": "BTCUSDT",
+    "depth": 10,
+    "update_ms": 100,
+    "fair_value": "microprice"
+  },
+  "task": {
+    "mode": "live_inference",
+    "run_for_seconds": 300,
+    "report_every_seconds": 5,
+    "models": [
+      {
+        "artifact": "models/market-up-1bp-1s.json"
+      }
+    ]
+  }
+}

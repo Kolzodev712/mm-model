@@ -1,7 +1,9 @@
 //! Decision-time feature schemas.
 //!
-//! Version 1 is the only schema. A model artifact must name the same version.
+//! Quote-conditioned rows use [`v1`]. Market-outcome rows use [`market`].
+//! A model artifact must name the schema for its own family.
 
+pub mod market;
 pub mod v1;
 
 pub use v1::{

@@ -17,7 +17,7 @@ use parquet::file::properties::WriterProperties;
 use crate::data::training::dataset::QuoteEvent;
 use crate::data::training::example::{FillFacts, LabelProvenance};
 use crate::data::training::quotes::{QuoteHistory, QuoteRange};
-use crate::domain::market::CandidateQuote;
+use crate::domain::market::QuoteContext;
 use crate::domain::units::{Fee, Price};
 
 pub const QUOTE_SCHEMA_VERSION: u32 = 1;
@@ -213,7 +213,7 @@ fn quotes_from_batch(
         if exchanges.value(row) != exchange || symbols.value(row) != symbol {
             return Err(QuoteStoreError::Row);
         }
-        let quote = CandidateQuote::new(price.value(row), qty.value(row))
+        let quote = QuoteContext::new(price.value(row), qty.value(row))
             .map_err(|_| QuoteStoreError::Row)?;
         let label = match provenance.value(row) {
             "observed" => LabelProvenance::Observed,
@@ -288,7 +288,7 @@ mod tests {
         };
         QuoteEvent::new(
             1_000,
-            CandidateQuote::new(100.0, 1.0).unwrap(),
+            QuoteContext::new(100.0, 1.0).unwrap(),
             provenance,
             facts,
         )

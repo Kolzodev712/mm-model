@@ -12,11 +12,10 @@
 
 use std::fmt;
 
-use crate::domain::market::{CandidateQuote, MarketState};
+use crate::domain::market::{MarketState, QuoteContext};
 use crate::model::fair_value::FairValueMethod;
 use crate::model::feature::v1::{extract_features, FEATURE_COUNT};
 use crate::model::fill::FillSample;
-use crate::model::pnl::PnlSample;
 
 /// Where a fill label came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -32,17 +31,17 @@ pub enum LabelProvenance {
     Simulated,
 }
 
-/// Market and candidate quote visible before the decision.
+/// Market state and quote context visible at the decision time.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DecisionTimeInputs {
     market: MarketState,
-    quote: CandidateQuote,
+    quote: QuoteContext,
 }
 
 impl DecisionTimeInputs {
     /// Stores a decision-time market and quote.
     #[must_use]
-    pub fn new(market: MarketState, quote: CandidateQuote) -> Self {
+    pub fn new(market: MarketState, quote: QuoteContext) -> Self {
         Self { market, quote }
     }
 
@@ -52,7 +51,7 @@ impl DecisionTimeInputs {
     }
 
     #[must_use]
-    pub fn quote(&self) -> CandidateQuote {
+    pub fn quote(&self) -> QuoteContext {
         self.quote
     }
 }
@@ -215,36 +214,8 @@ pub fn logistic_samples(
         samples.push(FillSample {
             features: extract_features(&example.inputs.market, &example.inputs.quote)
                 .map_err(|_| ExampleError::InvalidFeatures)?,
-            filled: matches!(example.outcome, ObservedOutcome::Filled { .. }),
+            positive: matches!(example.outcome, ObservedOutcome::Filled { .. }),
         });
-    }
-    Ok(samples)
-}
-
-/// Turns filled examples of one provenance into linear-regression samples.
-///
-/// Unfilled rows are omitted. They are not inserted with P&L of zero.
-/// Mixed provenance is rejected before any sample is returned.
-pub fn pnl_samples(
-    examples: &[TrainingExample],
-    provenance: LabelProvenance,
-    method: FairValueMethod,
-) -> Result<Vec<PnlSample<FEATURE_COUNT>>, ExampleError> {
-    let mut samples = Vec::new();
-    for example in examples {
-        if example.provenance != provenance {
-            return Err(ExampleError::MixedProvenance);
-        }
-        if example.method != method {
-            return Err(ExampleError::MixedFairValueMethod);
-        }
-        if let ObservedOutcome::Filled { pnl, .. } = example.outcome {
-            samples.push(PnlSample {
-                features: extract_features(&example.inputs.market, &example.inputs.quote)
-                    .map_err(|_| ExampleError::InvalidFeatures)?,
-                pnl,
-            });
-        }
     }
     Ok(samples)
 }
@@ -300,7 +271,7 @@ mod tests {
     fn inputs(method: FairValueMethod) -> DecisionTimeInputs {
         DecisionTimeInputs::new(
             method.derive_top(99.9, 2.0, 100.1, 1.0).unwrap(),
-            CandidateQuote::new(99.8, 2.0).unwrap(),
+            QuoteContext::new(99.8, 2.0).unwrap(),
         )
     }
 
@@ -336,8 +307,8 @@ mod tests {
         let missed_rows = logistic_samples(&[missed], LabelProvenance::Observed, method).unwrap();
         let filled_rows = logistic_samples(&[filled], LabelProvenance::Observed, method).unwrap();
         assert_eq!(missed_rows[0].features, filled_rows[0].features);
-        assert!(!missed_rows[0].filled);
-        assert!(filled_rows[0].filled);
+        assert!(!missed_rows[0].positive);
+        assert!(filled_rows[0].positive);
     }
 
     #[test]
@@ -356,10 +327,6 @@ mod tests {
         ];
         assert_eq!(
             logistic_samples(&rows, LabelProvenance::Observed, method),
-            Err(ExampleError::MixedProvenance)
-        );
-        assert_eq!(
-            pnl_samples(&rows, LabelProvenance::Simulated, method),
             Err(ExampleError::MixedProvenance)
         );
     }
@@ -385,45 +352,13 @@ mod tests {
             ),
         ];
         assert_eq!(
-            pnl_samples(
+            logistic_samples(
                 &rows,
                 LabelProvenance::Observed,
                 FairValueMethod::Microprice
             ),
             Err(ExampleError::MixedFairValueMethod)
         );
-    }
-
-    #[test]
-    fn conditional_pnl_samples_skip_unfilled_rows() {
-        let method = FairValueMethod::Microprice;
-        let rows = [
-            example(
-                ObservedOutcome::Unfilled,
-                LabelProvenance::Simulated,
-                method,
-            ),
-            example(
-                ObservedOutcome::Filled {
-                    pnl: 1.25,
-                    horizon_fair_value: 101.0,
-                },
-                LabelProvenance::Simulated,
-                method,
-            ),
-            example(
-                ObservedOutcome::Filled {
-                    pnl: -0.5,
-                    horizon_fair_value: 99.0,
-                },
-                LabelProvenance::Simulated,
-                method,
-            ),
-        ];
-        let samples = pnl_samples(&rows, LabelProvenance::Simulated, method).unwrap();
-        assert_eq!(samples.len(), 2);
-        assert_eq!(samples[0].pnl, 1.25);
-        assert_eq!(samples[1].pnl, -0.5);
     }
 
     #[test]

@@ -6,4 +6,5 @@
 pub mod dataset;
 pub mod example;
 pub mod history;
+pub mod market;
 pub mod quotes;

@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "data_root": "./data",
+  "market": {
+    "exchange": "binance_spot",
+    "symbol": "BTCUSDT",
+    "depth": 10,
+    "update_ms": 100,
+    "fair_value": "microprice"
+  },
+  "task": {
+    "mode": "live_inference",
+    "run_for_seconds": 300,
+    "report_every_seconds": 5,
+    "models": [
+      {
+        "artifact": "models/quote-fill-1s.json",
+        "quote_probes": [
+          { "distance_bps": 0.5, "quantity": 0.001 },
+          { "distance_bps": 1.0, "quantity": 0.001 },
+          { "distance_bps": 2.0, "quantity": 0.001 },
+          { "distance_bps": 5.0, "quantity": 0.001 }
+        ]
+      }
+    ]
+  }
+}

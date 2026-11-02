@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "data_root": "./data",
+  "market": {
+    "exchange": "binance_spot",
+    "symbol": "BTCUSDT",
+    "depth": 10,
+    "update_ms": 100,
+    "fair_value": "microprice"
+  },
+  "task": {
+    "mode": "collect",
+    "run_for_seconds": 30,
+    "flush_every_records": 10
+  }
+}

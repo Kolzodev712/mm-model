@@ -1,25 +1,14 @@
-//! Per-strategy estimates from historical quoting attempts.
+//! Descriptive counts for historical quote outcomes that share a [`StrategyId`].
 //!
-//! Observations that share a [`StrategyId`] are pooled.
-//! Each attempt is treated as independent. There is no clock, inventory path,
-//! or alignment between strategies: a fill on one strategy is not evidence
-//! about whether another quote would have filled at that moment.
+//! Each attempt is treated as independent. A fill on one recorded context is
+//! not evidence about whether another quote would have filled at that moment.
 //!
-//! The estimates below are the seam a later model can replace:
-//!
-//! - `P(fill | market state, candidate quote)`
-//! - expected P&L conditional on execution
-//!
-//! [`crate::model::selection`] consumes the resulting expected value and does not
-//! care whether it came from these counts or from a model.
-//!
-//! Learned fill and conditional-P&L models live beside this module. They do
-//! not replace these historical counts.
+//! `expected_value` is `fill_probability * average P&L if filled`. It is a
+//! summary of those attempts. It is not a score used to pick a strategy.
 
 use std::collections::BTreeMap;
 
 use crate::domain::{HistoricalObservation, StrategyId};
-use crate::model::selection::QuoteDecision;
 
 /// Aggregated historical performance of one strategy.
 #[derive(Debug, Clone, PartialEq)]
@@ -78,20 +67,6 @@ pub fn evaluate_strategies(observations: &[HistoricalObservation]) -> Vec<Strate
         .into_iter()
         .map(|(strategy_id, observations)| evaluate_group((*strategy_id).clone(), &observations))
         .collect()
-}
-
-/// Selects the historical strategy with the highest expected value.
-///
-/// When no strategy has expected value strictly above 0, the result is
-/// [`QuoteDecision::NoQuote`]. Ties keep the lexicographically smallest
-/// [`StrategyId`]. Non-finite expected values are ignored.
-#[must_use]
-pub fn select_quote(evaluations: &[StrategyEvaluation]) -> QuoteDecision {
-    crate::model::selection::select_ranked(
-        evaluations
-            .iter()
-            .map(|evaluation| (&evaluation.strategy_id, evaluation.expected_value)),
-    )
 }
 
 fn evaluate_group(
@@ -297,51 +272,15 @@ mod tests {
     }
 
     #[test]
-    fn learned_scores_use_the_same_rule() {
-        let evaluations = evaluate_strategies(&fixture::example_dataset());
-        let scores: Vec<crate::model::selection::ActionScore<'_>> = evaluations
-            .iter()
-            .map(|evaluation| crate::model::selection::ActionScore {
-                strategy_id: &evaluation.strategy_id,
-                expected_value: evaluation.expected_value,
-            })
-            .collect();
-        assert_eq!(
-            crate::model::selection::select_action(&scores),
-            select_quote(&evaluations)
-        );
-    }
-
-    #[test]
-    fn selects_strategy_with_highest_ev() {
-        let decision = select_quote(&evaluate_strategies(&fixture::example_dataset()));
-        match decision {
-            QuoteDecision::Quote {
-                strategy_id,
-                expected_value,
-            } => {
-                assert_eq!(strategy_id.as_str(), "B");
-                assert!((expected_value - 0.06).abs() < 1e-9);
-            }
-            QuoteDecision::NoQuote => panic!("strategy B has positive expected value"),
-        }
-    }
-
-    #[test]
-    fn selects_no_quote_when_all_ev_negative() {
+    fn negative_outcomes_remain_descriptive_counts() {
         let observations = vec![filled("A", 99.0), filled("B", 99.5)];
-        let decision = select_quote(&evaluate_strategies(&observations));
-        assert_eq!(decision, QuoteDecision::NoQuote);
-        assert_eq!(decision.expected_value(), 0.0);
+        let evaluations = evaluate_strategies(&observations);
+        assert!(evaluations.iter().all(|row| row.expected_value < 0.0));
+        assert!(evaluations.iter().all(|row| row.fill_probability == 1.0));
     }
 
     #[test]
-    fn empty_input_selects_no_quote() {
-        assert_eq!(select_quote(&[]), QuoteDecision::NoQuote);
-    }
-
-    #[test]
-    fn zero_fill_strategy_ties_no_quote() {
+    fn a_miss_has_zero_fill_probability_and_no_conditional_average() {
         let missed = HistoricalObservation::new(
             StrategyId::new("idle").unwrap(),
             99.0,
@@ -351,19 +290,9 @@ mod tests {
             0.0,
         )
         .unwrap();
-        let decision = select_quote(&evaluate_strategies(&[missed]));
-        assert_eq!(decision, QuoteDecision::NoQuote);
-    }
-
-    #[test]
-    fn equal_positive_ev_prefers_smaller_strategy_id() {
-        let observations = vec![filled("C", 100.25), filled("A", 100.25)];
-        assert_eq!(
-            select_quote(&evaluate_strategies(&observations))
-                .strategy_id()
-                .unwrap()
-                .as_str(),
-            "A"
-        );
+        let evaluation = &evaluate_strategies(&[missed])[0];
+        assert_eq!(evaluation.fill_probability, 0.0);
+        assert_eq!(evaluation.average_pnl_per_fill, None);
+        assert_eq!(evaluation.expected_value, 0.0);
     }
 }

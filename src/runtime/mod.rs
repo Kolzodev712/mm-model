@@ -1,8 +1,8 @@
 //! Long-running workflows. Math stays in [`crate::model`].
 
 pub mod clock;
+pub mod inference;
 pub mod reconnect;
-pub mod shadow;
 pub mod stats;
 
 #[cfg(feature = "parquet-storage")]

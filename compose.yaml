@@ -1,5 +1,5 @@
-# Experimental runner. The mode is selected in src/bin/mm_model.rs.
-# The container opens no inbound ports and stores nothing inside the image.
+# Experimental runner. The experiment is MM_CONFIG, defaulting to the image's sample.
+# The container opens no inbound ports and stores books only on the mounted data volume.
 
 services:
   mm-model:
@@ -8,6 +8,7 @@ services:
     user: "10001:10001"
     environment:
       MM_DATA_ROOT: /data
+      MM_CONFIG: /app/configs/default.json
     volumes:
       - ./data:/data
     read_only: true

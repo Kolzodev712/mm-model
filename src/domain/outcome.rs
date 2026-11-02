@@ -16,7 +16,7 @@
 
 use std::fmt;
 
-/// Identifier of a candidate quoting strategy.
+/// Label on a historical quote record. Grouping key for descriptive counts.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StrategyId(String);
 

@@ -1,6 +1,8 @@
 //! Versioned model file. Loading is a cold path and may allocate.
 //!
-//! The live book parser does not use this module.
+//! A file exists because the fit passed the research validation rule:
+//! holdout log loss strictly below the constant training-rate baseline.
+//! It is not a deployment to a trading system.
 
 use std::fmt;
 use std::fs;
@@ -9,51 +11,56 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::data::training::example::LabelProvenance;
+use crate::model::calibration::{CalibrationBin, CALIBRATION_BINS};
 use crate::model::fair_value::FairValueMethod;
+use crate::model::feature::market::{MARKET_FEATURE_COUNT, MARKET_FEATURE_SCHEMA_VERSION};
 use crate::model::feature::v1::{FEATURE_COUNT, FEATURE_SCHEMA_VERSION};
 use crate::model::fill::LogisticRegression;
-use crate::model::pnl::LinearRegression;
 use crate::model::prediction::InvalidWeights;
 
-pub const ARTIFACT_VERSION: u32 = 3;
+pub const ARTIFACT_VERSION: u32 = 4;
 
-/// Holdout comparison that was good enough to release for shadow experiments.
-///
-/// This is not a claim of statistical significance or trading profit.
+/// Which predictive problem a file answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ArtifactState {
-    PublishedForShadow,
+pub enum ModelFamily {
+    /// `P(fill within H | market state, quote context)`.
+    QuoteFill,
+    /// `P(reference price rises by at least a threshold within H | market state)`.
+    MarketUpMove,
 }
 
-/// Structured holdout comparison. Baselines are computed from the training slice only.
-///
-/// `ev_*_error` is mean absolute error of predicted attempt P&L on quotes that
-/// were actually submitted. It does not measure whether a different quote would
-/// have been better.
+/// Where the binary labels came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LabelSource {
+    /// Quote outcomes exported from a system that submitted the quotes.
+    ObservedQuote,
+    /// Quote outcomes marked as simulated.
+    SimulatedQuote,
+    /// Labels computed from later public book snapshots.
+    PublicBook,
+}
+
+/// Structured holdout comparison. The constant baseline uses the training slice only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationReport {
-    /// Rows whose decision time was before the holdout, before purging.
     pub rows_before_purge: u64,
-    /// Training rows removed because `horizon_snapshot_ns` reached the holdout.
     pub purged_training_rows: u64,
-    /// `rows_before_purge - purged_training_rows`. This is the fitted sample.
+    /// Fitted sample. Equals `rows_before_purge - purged_training_rows`.
     pub train_examples: u64,
     pub holdout_examples: u64,
-    /// Decision time of the first holdout row. Training labels must finish before this.
     pub holdout_start_ns: i64,
-    pub train_fills: u64,
-    pub train_misses: u64,
-    pub holdout_fills: u64,
-    pub holdout_misses: u64,
-    pub fill_model_loss: f64,
-    pub fill_baseline_loss: f64,
-    pub pnl_model_loss: f64,
-    pub pnl_baseline_loss: f64,
-    pub ev_model_error: f64,
-    pub ev_baseline_error: f64,
+    pub train_positives: u64,
+    pub train_negatives: u64,
+    pub holdout_positives: u64,
+    pub holdout_negatives: u64,
+    pub log_loss: f64,
+    pub baseline_log_loss: f64,
+    pub brier: f64,
+    pub baseline_brier: f64,
+    pub calibration: [CalibrationBin; CALIBRATION_BINS],
 }
 
 /// Parameters and the metadata required to refuse an incompatible run.
@@ -61,41 +68,42 @@ pub struct ValidationReport {
 #[serde(deny_unknown_fields)]
 pub struct ModelArtifact {
     pub version: u32,
+    pub family: ModelFamily,
     pub feature_schema: u32,
     pub fair_value_method: FairValueMethod,
     pub training_horizon_ns: i64,
-    pub fill_bias: f64,
-    pub fill_weights: Vec<f64>,
-    pub pnl_bias: f64,
-    pub pnl_weights: Vec<f64>,
-    pub label_provenance: LabelProvenance,
-    pub state: ArtifactState,
+    /// Present for [`ModelFamily::MarketUpMove`]. Absent for quote fill.
+    pub threshold_bps: Option<f64>,
+    pub bias: f64,
+    pub weights: Vec<f64>,
+    pub label_source: LabelSource,
     pub window_from_ns: i64,
     pub window_to_ns: i64,
     pub dataset_id: String,
     pub report: ValidationReport,
 }
 
-/// Provenance stored with a released artifact.
+/// Identity stored with a validated artifact.
 pub struct ArtifactMetadata {
-    pub provenance: LabelProvenance,
+    pub label_source: LabelSource,
     pub window_from_ns: i64,
     pub window_to_ns: i64,
     pub dataset_id: String,
 }
 
 impl ModelArtifact {
-    /// Builds a complete shadow release, or refuses incomplete evidence.
-    pub fn published_for_shadow(
+    /// Builds a validated research artifact, or refuses a report that did not beat the baseline.
+    pub fn validated<const N: usize>(
+        family: ModelFamily,
         method: FairValueMethod,
         training_horizon_ns: i64,
-        fill: &LogisticRegression<FEATURE_COUNT>,
-        pnl: &LinearRegression<FEATURE_COUNT>,
+        threshold_bps: Option<f64>,
+        model: &LogisticRegression<N>,
         metadata: ArtifactMetadata,
         report: ValidationReport,
     ) -> Result<Self, ArtifactError> {
         let ArtifactMetadata {
-            provenance,
+            label_source,
             window_from_ns,
             window_to_ns,
             dataset_id,
@@ -103,45 +111,47 @@ impl ModelArtifact {
         if training_horizon_ns <= 0 || window_from_ns >= window_to_ns || dataset_id.is_empty() {
             return Err(ArtifactError::Evidence);
         }
-        if provenance != LabelProvenance::Observed {
-            return Err(ArtifactError::Provenance);
+        if !family_matches(family, label_source, threshold_bps) {
+            return Err(ArtifactError::Target);
         }
         if !report_is_acceptable(&report) {
             return Err(ArtifactError::Evidence);
         }
         let artifact = Self {
             version: ARTIFACT_VERSION,
-            feature_schema: FEATURE_SCHEMA_VERSION,
+            family,
+            feature_schema: schema_version(family),
             fair_value_method: method,
             training_horizon_ns,
-            fill_bias: fill.bias(),
-            fill_weights: fill.weights().to_vec(),
-            pnl_bias: pnl.bias(),
-            pnl_weights: pnl.weights().to_vec(),
-            label_provenance: provenance,
-            state: ArtifactState::PublishedForShadow,
+            threshold_bps,
+            bias: model.bias(),
+            weights: model.weights().to_vec(),
+            label_source,
             window_from_ns,
             window_to_ns,
             dataset_id,
             report,
         };
-        artifact.validate_for_run(method)?;
+        artifact.validate_family(family, method)?;
         Ok(artifact)
     }
 
-    /// Refuses a file that is not an observed model released for shadow experiments.
-    pub fn validate_for_shadow(
+    /// Refuses a file whose family, schema, method, horizon, or threshold does not match.
+    pub fn validate_for_inference(
         &self,
+        family: ModelFamily,
         method: FairValueMethod,
         horizon_ns: i64,
+        threshold_bps: Option<f64>,
     ) -> Result<(), ArtifactError> {
-        self.validate_for_run(method)?;
-        self.validate_horizon(horizon_ns)?;
-        if self.state != ArtifactState::PublishedForShadow {
-            return Err(ArtifactError::State);
+        self.validate_family(family, method)?;
+        if self.training_horizon_ns != horizon_ns {
+            return Err(ArtifactError::Horizon);
         }
-        if self.label_provenance != LabelProvenance::Observed {
-            return Err(ArtifactError::Provenance);
+        match (self.threshold_bps, threshold_bps) {
+            (None, None) => {}
+            (Some(stored), Some(expected)) if (stored - expected).abs() <= 1e-9 => {}
+            _ => return Err(ArtifactError::Target),
         }
         if !report_is_acceptable(&self.report) {
             return Err(ArtifactError::Evidence);
@@ -149,11 +159,18 @@ impl ModelArtifact {
         Ok(())
     }
 
-    pub fn validate_for_run(&self, method: FairValueMethod) -> Result<(), ArtifactError> {
+    pub fn validate_family(
+        &self,
+        family: ModelFamily,
+        method: FairValueMethod,
+    ) -> Result<(), ArtifactError> {
         if self.version != ARTIFACT_VERSION {
             return Err(ArtifactError::Version);
         }
-        if self.feature_schema != FEATURE_SCHEMA_VERSION {
+        if self.family != family {
+            return Err(ArtifactError::Target);
+        }
+        if self.feature_schema != schema_version(family) {
             return Err(ArtifactError::FeatureSchema);
         }
         if self.fair_value_method != method {
@@ -162,45 +179,32 @@ impl ModelArtifact {
         if self.training_horizon_ns <= 0 {
             return Err(ArtifactError::Horizon);
         }
-        if self.fill_weights.len() != FEATURE_COUNT || self.pnl_weights.len() != FEATURE_COUNT {
+        if self.weights.len() != feature_count(family) {
             return Err(ArtifactError::Weights);
         }
-        if !self.fill_bias.is_finite()
-            || !self.pnl_bias.is_finite()
-            || self.fill_weights.iter().any(|weight| !weight.is_finite())
-            || self.pnl_weights.iter().any(|weight| !weight.is_finite())
-        {
+        if !self.bias.is_finite() || self.weights.iter().any(|weight| !weight.is_finite()) {
             return Err(ArtifactError::Weights);
+        }
+        if !family_matches(family, self.label_source, self.threshold_bps) {
+            return Err(ArtifactError::Target);
         }
         Ok(())
     }
 
-    pub fn validate_horizon(&self, horizon_ns: i64) -> Result<(), ArtifactError> {
-        if self.training_horizon_ns != horizon_ns {
-            return Err(ArtifactError::Horizon);
-        }
-        Ok(())
+    /// Quote-fill weights. Refuses a market-outcome file.
+    pub fn quote_model(&self) -> Result<LogisticRegression<FEATURE_COUNT>, ArtifactError> {
+        self.validate_family(ModelFamily::QuoteFill, self.fair_value_method)?;
+        let mut weights = [0.0; FEATURE_COUNT];
+        weights.copy_from_slice(&self.weights);
+        LogisticRegression::from_weights(self.bias, weights).map_err(|_| ArtifactError::Weights)
     }
 
-    pub fn models(
-        &self,
-    ) -> Result<
-        (
-            LogisticRegression<FEATURE_COUNT>,
-            LinearRegression<FEATURE_COUNT>,
-        ),
-        ArtifactError,
-    > {
-        self.validate_for_run(self.fair_value_method)?;
-        let mut fill_weights = [0.0; FEATURE_COUNT];
-        let mut pnl_weights = [0.0; FEATURE_COUNT];
-        fill_weights.copy_from_slice(&self.fill_weights);
-        pnl_weights.copy_from_slice(&self.pnl_weights);
-        let fill = LogisticRegression::from_weights(self.fill_bias, fill_weights)
-            .map_err(|_| ArtifactError::Weights)?;
-        let pnl = LinearRegression::from_weights(self.pnl_bias, pnl_weights)
-            .map_err(|_| ArtifactError::Weights)?;
-        Ok((fill, pnl))
+    /// Market-outcome weights. Refuses a quote-fill file.
+    pub fn market_model(&self) -> Result<LogisticRegression<MARKET_FEATURE_COUNT>, ArtifactError> {
+        self.validate_family(ModelFamily::MarketUpMove, self.fair_value_method)?;
+        let mut weights = [0.0; MARKET_FEATURE_COUNT];
+        weights.copy_from_slice(&self.weights);
+        LogisticRegression::from_weights(self.bias, weights).map_err(|_| ArtifactError::Weights)
     }
 
     pub fn write_json(&self, path: &Path) -> Result<(), ArtifactError> {
@@ -234,44 +238,75 @@ impl ModelArtifact {
     }
 }
 
-/// Fill and conditional P&L may tie their constant baselines. Combined EV must be strictly better.
-pub fn losses_accept(
-    fill_model: f64,
-    fill_baseline: f64,
-    pnl_model: f64,
-    pnl_baseline: f64,
-    ev_model: f64,
-    ev_baseline: f64,
+fn schema_version(family: ModelFamily) -> u32 {
+    match family {
+        ModelFamily::QuoteFill => FEATURE_SCHEMA_VERSION,
+        ModelFamily::MarketUpMove => MARKET_FEATURE_SCHEMA_VERSION,
+    }
+}
+
+fn feature_count(family: ModelFamily) -> usize {
+    match family {
+        ModelFamily::QuoteFill => FEATURE_COUNT,
+        ModelFamily::MarketUpMove => MARKET_FEATURE_COUNT,
+    }
+}
+
+fn family_matches(
+    family: ModelFamily,
+    label_source: LabelSource,
+    threshold_bps: Option<f64>,
 ) -> bool {
-    fill_model <= fill_baseline && pnl_model <= pnl_baseline && ev_model < ev_baseline
+    match family {
+        ModelFamily::QuoteFill => {
+            threshold_bps.is_none()
+                && matches!(
+                    label_source,
+                    LabelSource::ObservedQuote | LabelSource::SimulatedQuote
+                )
+        }
+        ModelFamily::MarketUpMove => {
+            matches!(threshold_bps, Some(bps) if bps.is_finite() && bps >= 0.0)
+                && label_source == LabelSource::PublicBook
+        }
+    }
+}
+
+/// Holdout log loss must be strictly better than the constant training baseline.
+pub fn log_loss_accepts(model_loss: f64, baseline_loss: f64) -> bool {
+    model_loss < baseline_loss
 }
 
 fn report_is_acceptable(report: &ValidationReport) -> bool {
-    let losses = [
-        report.fill_model_loss,
-        report.fill_baseline_loss,
-        report.pnl_model_loss,
-        report.pnl_baseline_loss,
-        report.ev_model_error,
-        report.ev_baseline_error,
+    let numbers = [
+        report.log_loss,
+        report.baseline_log_loss,
+        report.brier,
+        report.baseline_brier,
     ];
     report.rows_before_purge >= report.purged_training_rows
         && report.train_examples == report.rows_before_purge - report.purged_training_rows
         && report.train_examples > 0
         && report.holdout_examples > 0
-        && report.train_fills > 0
-        && report.train_misses > 0
-        && report.holdout_fills > 0
-        && report.holdout_misses > 0
-        && losses.iter().all(|value| value.is_finite())
-        && losses_accept(
-            report.fill_model_loss,
-            report.fill_baseline_loss,
-            report.pnl_model_loss,
-            report.pnl_baseline_loss,
-            report.ev_model_error,
-            report.ev_baseline_error,
-        )
+        && report.train_positives > 0
+        && report.train_negatives > 0
+        && report.holdout_positives > 0
+        && report.holdout_negatives > 0
+        && numbers.iter().all(|value| value.is_finite())
+        && report.calibration.iter().all(bin_is_finite)
+        && log_loss_accepts(report.log_loss, report.baseline_log_loss)
+}
+
+fn bin_is_finite(bin: &CalibrationBin) -> bool {
+    bin.lower.is_finite()
+        && bin.upper.is_finite()
+        && match (bin.count, bin.mean_predicted, bin.observed_frequency) {
+            (0, None, None) => true,
+            (count, Some(mean), Some(frequency)) if count > 0 => {
+                mean.is_finite() && frequency.is_finite()
+            }
+            _ => false,
+        }
 }
 
 impl From<InvalidWeights> for ArtifactError {
@@ -290,8 +325,7 @@ pub enum ArtifactError {
     Weights,
     Json,
     Io,
-    State,
-    Provenance,
+    Target,
     Evidence,
 }
 
@@ -305,9 +339,8 @@ impl fmt::Display for ArtifactError {
             Self::Weights => "model weights are missing, the wrong length, or not finite",
             Self::Json => "model artifact is not valid JSON",
             Self::Io => "model artifact could not be read or written",
-            Self::State => "model artifact is not released for shadow experiments",
-            Self::Provenance => "shadow loading requires observed fill labels",
-            Self::Evidence => "model artifact does not record enough training evidence",
+            Self::Target => "model family, label source, or threshold does not match",
+            Self::Evidence => "model artifact did not pass the configured validation rule",
         };
         f.write_str(message)
     }
@@ -318,6 +351,13 @@ impl std::error::Error for ArtifactError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::calibration::{score_probabilities, CalibrationBin, CALIBRATION_BINS};
+
+    fn empty_bins() -> [CalibrationBin; CALIBRATION_BINS] {
+        score_probabilities(&[(0.2, false), (0.8, true)])
+            .unwrap()
+            .bins
+    }
 
     fn passing_report() -> ValidationReport {
         ValidationReport {
@@ -326,61 +366,76 @@ mod tests {
             train_examples: 16,
             holdout_examples: 4,
             holdout_start_ns: 1_000,
-            train_fills: 4,
-            train_misses: 4,
-            holdout_fills: 2,
-            holdout_misses: 2,
-            fill_model_loss: 0.4,
-            fill_baseline_loss: 0.6,
-            pnl_model_loss: 1.0,
-            pnl_baseline_loss: 1.5,
-            ev_model_error: 0.2,
-            ev_baseline_error: 0.3,
+            train_positives: 4,
+            train_negatives: 12,
+            holdout_positives: 2,
+            holdout_negatives: 2,
+            log_loss: 0.4,
+            baseline_log_loss: 0.6,
+            brier: 0.2,
+            baseline_brier: 0.25,
+            calibration: empty_bins(),
         }
     }
 
-    #[test]
-    fn schema_method_and_old_version_fail() {
-        let (fill, pnl) = crate::data::synthetic::train_demo_models().unwrap();
-        let artifact = ModelArtifact::published_for_shadow(
+    fn quote_artifact(
+        source: LabelSource,
+        report: ValidationReport,
+    ) -> Result<ModelArtifact, ArtifactError> {
+        let model = LogisticRegression::<FEATURE_COUNT>::zeros();
+        ModelArtifact::validated(
+            ModelFamily::QuoteFill,
             FairValueMethod::Microprice,
             1_000,
-            &fill,
-            &pnl,
+            None,
+            &model,
             ArtifactMetadata {
-                provenance: LabelProvenance::Observed,
+                label_source: source,
                 window_from_ns: 0,
                 window_to_ns: 10,
                 dataset_id: "dataset".into(),
             },
-            passing_report(),
+            report,
         )
-        .unwrap();
+    }
+
+    #[test]
+    fn a_quote_artifact_is_refused_as_a_market_model() {
+        let artifact = quote_artifact(LabelSource::ObservedQuote, passing_report()).unwrap();
         artifact
-            .validate_for_shadow(FairValueMethod::Microprice, 1_000)
+            .validate_for_inference(
+                ModelFamily::QuoteFill,
+                FairValueMethod::Microprice,
+                1_000,
+                None,
+            )
             .unwrap();
         assert_eq!(
-            artifact.validate_for_run(FairValueMethod::Midpoint),
-            Err(ArtifactError::FairValueMethod)
+            artifact.validate_for_inference(
+                ModelFamily::MarketUpMove,
+                FairValueMethod::Microprice,
+                1_000,
+                Some(1.0),
+            ),
+            Err(ArtifactError::Target)
         );
+        assert!(artifact.market_model().is_err());
+        assert!(artifact.quote_model().is_ok());
+    }
+
+    #[test]
+    fn a_tie_with_the_constant_baseline_is_not_validated() {
+        let mut report = passing_report();
+        report.log_loss = report.baseline_log_loss;
+        assert!(!log_loss_accepts(report.log_loss, report.baseline_log_loss));
         assert_eq!(
-            artifact.validate_horizon(2_000),
-            Err(ArtifactError::Horizon)
+            quote_artifact(LabelSource::ObservedQuote, report).unwrap_err(),
+            ArtifactError::Evidence
         );
-        assert!(ModelArtifact::published_for_shadow(
-            FairValueMethod::Microprice,
-            1_000,
-            &fill,
-            &pnl,
-            ArtifactMetadata {
-                provenance: LabelProvenance::Simulated,
-                window_from_ns: 0,
-                window_to_ns: 10,
-                dataset_id: "dataset".into(),
-            },
-            passing_report(),
-        )
-        .is_err());
+    }
+
+    #[test]
+    fn an_older_artifact_version_is_rejected() {
         let path = std::env::temp_dir().join(format!(
             "mm-artifact-{}",
             std::time::SystemTime::now()
@@ -388,43 +443,11 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::write(&path, r#"{"version":1}"#).unwrap();
+        std::fs::write(&path, r#"{"version":3}"#).unwrap();
         assert_eq!(
             ModelArtifact::read_json(&path).unwrap_err(),
             ArtifactError::Json
         );
         let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn a_tie_with_the_constant_ev_baseline_is_not_published() {
-        let (fill, pnl) = crate::data::synthetic::train_demo_models().unwrap();
-        let mut report = passing_report();
-        report.ev_model_error = report.ev_baseline_error;
-        assert!(!losses_accept(
-            report.fill_model_loss,
-            report.fill_baseline_loss,
-            report.pnl_model_loss,
-            report.pnl_baseline_loss,
-            report.ev_model_error,
-            report.ev_baseline_error,
-        ));
-        assert_eq!(
-            ModelArtifact::published_for_shadow(
-                FairValueMethod::Microprice,
-                1_000,
-                &fill,
-                &pnl,
-                ArtifactMetadata {
-                    provenance: LabelProvenance::Observed,
-                    window_from_ns: 0,
-                    window_to_ns: 10,
-                    dataset_id: "dataset".into(),
-                },
-                report,
-            )
-            .unwrap_err(),
-            ArtifactError::Evidence
-        );
     }
 }

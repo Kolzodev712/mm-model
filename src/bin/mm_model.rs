@@ -1,6 +1,7 @@
-//! Composition root. Change the experiment by editing [`configuration`].
+//! Composition root. The experiment is a JSON file, not source edits.
 //!
-//! This process does not send orders.
+//! This process reads public market data and writes probabilities. It does
+//! not submit orders or choose a quote.
 
 #![deny(unsafe_code)]
 
@@ -12,16 +13,16 @@ use std::time::Duration;
 
 use mm_model::data::market::binance::client::BinanceBookClient;
 use mm_model::data::market::binance::parser::{BinanceBookConfig, BINANCE_SPOT_WS};
-use mm_model::model::fair_value::FairValueMethod;
+use mm_model::model::artifact::{ModelArtifact, ModelFamily};
+use mm_model::model::feature::market::MARKET_FEATURE_COUNT;
+use mm_model::model::feature::v1::FEATURE_COUNT;
+use mm_model::model::fill::LogisticRegression;
+use mm_model::model::market::MarketOutcomeDefinition;
 use mm_model::runtime::clock::SystemClock;
-use mm_model::runtime::config::{
-    AppConfig, EvidencePolicy, Exchange, MarketConfig, RunMode, ShadowConfig, StorageConfig,
-    Symbol, TrainingConfig, TrainingTrigger,
-};
+use mm_model::runtime::config::{AppConfig, RunMode, TaskConfig, DEFAULT_CONFIG_PATH};
+use mm_model::runtime::inference::run_live;
 use mm_model::runtime::orchestrator::run_source;
 use mm_model::runtime::reconnect::ReconnectPolicy;
-use mm_model::runtime::shadow::run_live;
-use mm_model::storage::quotes::quote_file;
 
 fn main() -> ExitCode {
     match execute() {
@@ -34,7 +35,11 @@ fn main() -> ExitCode {
 }
 
 fn execute() -> Result<(), Box<dyn std::error::Error>> {
-    let config = configuration()?;
+    let config_path = std::env::var_os("MM_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+    let data_root = std::env::var_os("MM_DATA_ROOT").map(PathBuf::from);
+    let config = AppConfig::load(&config_path, data_root.as_deref())?;
     config.validate()?;
     tracing_subscriber::fmt()
         .with_env_filter("info")
@@ -52,80 +57,96 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let policy = ReconnectPolicy::new(8, Duration::from_millis(250), Duration::from_secs(5))
         .map_err(|err| err.to_string())?;
-    match config.mode {
+    match config.mode() {
         RunMode::Train => {
             let mut idle = mm_model::data::market::source::SliceSource::new(Vec::new());
             let outcomes = run_source(&config, &mut idle, should_stop)?;
             tracing::info!(results = outcomes.len(), "train mode finished");
         }
-        RunMode::Shadow => {
-            if config.shadow.demo_model {
-                eprintln!("DEMO MODEL — predictions are not trading-valid");
-            }
-            let (fill, pnl) = if config.shadow.demo_model {
-                mm_model::data::synthetic::train_demo_models()?
-            } else {
-                let artifact =
-                    mm_model::model::artifact::ModelArtifact::read_json(&config.shadow.model_path)?;
-                artifact
-                    .validate_for_shadow(config.market.fair_value, config.training.horizon_ns)?;
-                artifact.models()?
-            };
+        RunMode::LiveInference => {
+            let loaded = load_live_models(&config)?;
             let mut client = BinanceBookClient::connect(&market, SystemClock, policy)?;
-            let stats = run_live(&config, &mut client, &fill, &pnl, &should_stop)?;
+            let stats = run_live(
+                &config,
+                &mut client,
+                loaded.quote.as_ref(),
+                loaded.market.as_ref(),
+                loaded.definition,
+                &should_stop,
+            )?;
             tracing::info!(
                 books = stats.books_processed,
-                "shadow finished; predictions are not realized fills or P&L"
+                "live inference finished; logged numbers are probabilities"
             );
         }
-        RunMode::Collect | RunMode::CollectAndTrain => {
+        RunMode::Collect => {
             let mut client = BinanceBookClient::connect(&market, SystemClock, policy)?;
-            let outcomes = run_source(&config, &mut client, should_stop)?;
-            tracing::info!(
-                reconnects = client.reconnects(),
-                training_results = outcomes.len(),
-                "collection finished"
-            );
+            run_source(&config, &mut client, should_stop)?;
+            tracing::info!(reconnects = client.reconnects(), "collection finished");
         }
     }
     Ok(())
 }
 
-fn configuration() -> Result<AppConfig, mm_model::runtime::config::ConfigError> {
-    let root = std::env::var_os("MM_DATA_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("./data"));
-    let symbol = Symbol::new("BTCUSDT")?;
-    Ok(AppConfig {
-        // Edit this mode to change the experiment. No CLI parser is required.
-        mode: RunMode::Shadow,
-        market: MarketConfig {
-            exchange: Exchange::BinanceSpot,
-            symbol,
-            depth: 10,
-            update_ms: 100,
-            fair_value: FairValueMethod::Microprice,
-        },
-        storage: StorageConfig {
-            root: root.clone(),
-            flush_every: 10,
-        },
-        training: TrainingConfig {
-            horizon_ns: 60_000_000_000,
-            window_from_ns: 0,
-            window_to_ns: i64::MAX / 4,
-            trigger: TrainingTrigger::EveryPublishedPartitions(1),
-            artifact_path: root.join("models/current.json"),
-            quotes_path: quote_file(&root, "binance", "BTCUSDT"),
-            evidence: EvidencePolicy::default(),
-        },
-        shadow: ShadowConfig {
-            quantity: 0.001,
-            offsets_bps: "0.5,1,2,5".into(),
-            demo_model: true,
-            model_path: root.join("models/current.json"),
-            report_every: Duration::from_secs(5),
-        },
-        run_for: Some(Duration::from_secs(30)),
-    })
+struct LoadedModels {
+    quote: Option<LogisticRegression<FEATURE_COUNT>>,
+    market: Option<LogisticRegression<MARKET_FEATURE_COUNT>>,
+    definition: Option<MarketOutcomeDefinition>,
+}
+
+fn load_live_models(config: &AppConfig) -> Result<LoadedModels, Box<dyn std::error::Error>> {
+    let TaskConfig::LiveInference(task) = &config.task else {
+        return Err("live inference requires a live_inference task".into());
+    };
+    let mut loaded = LoadedModels {
+        quote: None,
+        market: None,
+        definition: None,
+    };
+    for model in &task.models {
+        let artifact = ModelArtifact::read_json(&model.artifact_path)?;
+        match artifact.family {
+            ModelFamily::QuoteFill => {
+                if loaded.quote.is_some() {
+                    return Err("live inference accepts one quote-fill artifact".into());
+                }
+                if model.probes.is_empty() {
+                    return Err("a quote-fill artifact needs at least one quote probe".into());
+                }
+                artifact.validate_for_inference(
+                    ModelFamily::QuoteFill,
+                    config.market.fair_value,
+                    artifact.training_horizon_ns,
+                    None,
+                )?;
+                loaded.quote = Some(artifact.quote_model()?);
+            }
+            ModelFamily::MarketUpMove => {
+                if loaded.market.is_some() {
+                    return Err("live inference accepts one market-outcome artifact".into());
+                }
+                if !model.probes.is_empty() {
+                    return Err(
+                        "quote probes are only defined for a quote-fill artifact; a market-outcome artifact does not take them"
+                            .into(),
+                    );
+                }
+                let threshold = artifact
+                    .threshold_bps
+                    .ok_or("market artifact is missing its up-move threshold")?;
+                artifact.validate_for_inference(
+                    ModelFamily::MarketUpMove,
+                    config.market.fair_value,
+                    artifact.training_horizon_ns,
+                    Some(threshold),
+                )?;
+                loaded.definition = Some(MarketOutcomeDefinition::new_up_move(
+                    artifact.training_horizon_ns,
+                    threshold,
+                )?);
+                loaded.market = Some(artifact.market_model()?);
+            }
+        }
+    }
+    Ok(loaded)
 }

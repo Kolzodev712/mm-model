@@ -1,6 +1,7 @@
-//! Logistic regression for `P(fill | features)`.
+//! Logistic regression for a binary probability.
 //!
-//! This is a reference baseline, not a claim about the best fill model.
+//! Quote-fill training and market-outcome training both use this trainer.
+//! This is a reference implementation, not a claim about the best classifier.
 //!
 //! ```text
 //! z = bias + w · x
@@ -29,16 +30,16 @@ use crate::model::prediction::{
     TrainConfig, TrainError,
 };
 
-/// One fill observation already turned into features.
+/// One binary observation already turned into features.
 ///
-/// `filled` must come from a submitted order or from a record explicitly marked
-/// as simulated. This type does not invent a label for a quote that was never sent.
+/// Quote-fill rows and market-outcome rows both use this sample. The label
+/// is supplied by the dataset builder. This type does not invent one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FillSample<const N: usize> {
     /// Decision-time features.
     pub features: FeatureVector<N>,
-    /// `true` when that submitted quote filled.
-    pub filled: bool,
+    /// `true` when the configured binary event occurred.
+    pub positive: bool,
 }
 
 /// Bias plus a fixed weight array.
@@ -87,7 +88,7 @@ impl<const N: usize> LogisticRegression<N> {
                 .predict_probability(&sample.features)
                 .map_err(|_| TrainError::NonFinitePrediction)?
                 .get();
-            total += binary_cross_entropy(sample_label(sample.filled), probability);
+            total += binary_cross_entropy(sample_label(sample.positive), probability);
         }
         Ok(total / samples.len() as f64)
     }
@@ -115,7 +116,7 @@ impl<const N: usize> LogisticRegression<N> {
                     .predict_probability(&sample.features)
                     .map_err(|_| TrainError::NonFinitePrediction)?
                     .get();
-                let residual = probability - sample_label(sample.filled);
+                let residual = probability - sample_label(sample.positive);
                 bias_grad += residual;
                 for (gradient, value) in weight_grad.iter_mut().zip(sample.features.as_array()) {
                     *gradient += residual * value;
@@ -148,8 +149,8 @@ impl<const N: usize> FillProbabilityModel<N> for LogisticRegression<N> {
     }
 }
 
-fn sample_label(filled: bool) -> f64 {
-    if filled {
+fn sample_label(positive: bool) -> f64 {
+    if positive {
         1.0
     } else {
         0.0
@@ -192,19 +193,19 @@ mod tests {
         vec![
             FillSample {
                 features: row(-2.0),
-                filled: false,
+                positive: false,
             },
             FillSample {
                 features: row(-1.0),
-                filled: false,
+                positive: false,
             },
             FillSample {
                 features: row(1.0),
-                filled: true,
+                positive: true,
             },
             FillSample {
                 features: row(2.0),
-                filled: true,
+                positive: true,
             },
         ]
     }

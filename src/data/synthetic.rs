@@ -1,54 +1,73 @@
-//! Deterministic synthetic model used only to exercise the shadow path.
+//! Deterministic demo weights used only to exercise live inference.
 //!
-//! The rows are [`LabelProvenance::Simulated`]. They are not exchange fills.
-//! Output from this model is not trading-valid.
+//! The quote rows are [`LabelProvenance::Simulated`]. They are not exchange fills.
+//! Output from these models is not a validated artifact.
 
 use crate::data::training::example::{
-    logistic_samples, pnl_samples, DecisionTimeInputs, LabelProvenance, LabelTiming,
-    ObservedOutcome, TrainingExample,
+    logistic_samples, DecisionTimeInputs, LabelProvenance, LabelTiming, ObservedOutcome,
+    TrainingExample,
 };
-use crate::domain::market::CandidateQuote;
+use crate::domain::market::QuoteContext;
 use crate::model::fair_value::FairValueMethod;
-use crate::model::feature::v1::FEATURE_COUNT;
-use crate::model::fill::LogisticRegression;
-use crate::model::pnl::LinearRegression;
+use crate::model::feature::market::MARKET_FEATURE_COUNT;
+use crate::model::feature::v1::{FeatureVector, FEATURE_COUNT};
+use crate::model::fill::{FillSample, LogisticRegression};
 use crate::model::prediction::{TrainConfig, TrainError};
 
-pub const DEMO_WARNING: &str = "DEMO MODEL — predictions are not trading-valid";
+pub const DEMO_WARNING: &str = "DEMO MODEL — probabilities are not from a validated artifact";
 
-/// Trains the reference models on a fixed simulated sample.
-pub fn train_demo_models() -> Result<
-    (
-        LogisticRegression<FEATURE_COUNT>,
-        LinearRegression<FEATURE_COUNT>,
-    ),
-    TrainError,
-> {
+/// Trains the demo quote-fill model on a fixed simulated sample.
+pub fn train_demo_quote_model() -> Result<LogisticRegression<FEATURE_COUNT>, TrainError> {
     let rows = demo_rows();
     debug_assert!(rows
         .iter()
         .all(|row| row.provenance() == LabelProvenance::Simulated));
-    let fill_rows = logistic_samples(
+    let samples = logistic_samples(
         &rows,
         LabelProvenance::Simulated,
         FairValueMethod::Microprice,
     )
     .map_err(|_| TrainError::EmptyDataset)?;
-    let pnl_rows = pnl_samples(
-        &rows,
-        LabelProvenance::Simulated,
-        FairValueMethod::Microprice,
-    )
-    .map_err(|_| TrainError::EmptyDataset)?;
-    let mut fill = LogisticRegression::<FEATURE_COUNT>::zeros();
-    let mut pnl = LinearRegression::<FEATURE_COUNT>::zeros();
-    let config = TrainConfig {
-        learning_rate: 0.2,
-        epochs: 80,
-    };
-    fill.train(&fill_rows, config)?;
-    pnl.train(&pnl_rows, config)?;
-    Ok((fill, pnl))
+    let mut model = LogisticRegression::<FEATURE_COUNT>::zeros();
+    model.train(
+        &samples,
+        TrainConfig {
+            learning_rate: 0.2,
+            epochs: 80,
+        },
+    )?;
+    Ok(model)
+}
+
+/// Trains the demo market model on a fixed feature sample.
+pub fn train_demo_market_model() -> Result<LogisticRegression<MARKET_FEATURE_COUNT>, TrainError> {
+    let samples = [
+        FillSample {
+            features: FeatureVector::new([1.0, 0.2, 0.1]).unwrap(),
+            positive: true,
+        },
+        FillSample {
+            features: FeatureVector::new([1.0, -0.4, -0.2]).unwrap(),
+            positive: false,
+        },
+        FillSample {
+            features: FeatureVector::new([2.0, 0.5, 0.3]).unwrap(),
+            positive: true,
+        },
+        FillSample {
+            features: FeatureVector::new([4.0, -0.8, -0.4]).unwrap(),
+            positive: false,
+        },
+    ];
+    let mut model = LogisticRegression::<MARKET_FEATURE_COUNT>::zeros();
+    model.train(
+        &samples,
+        TrainConfig {
+            learning_rate: 0.2,
+            epochs: 80,
+        },
+    )?;
+    Ok(model)
 }
 
 fn demo_rows() -> Vec<TrainingExample> {
@@ -79,7 +98,7 @@ fn demo_rows() -> Vec<TrainingExample> {
                 ObservedOutcome::Unfilled
             };
             TrainingExample::new(
-                DecisionTimeInputs::new(market, CandidateQuote::new(price, 1.0).unwrap()),
+                DecisionTimeInputs::new(market, QuoteContext::new(price, 1.0).unwrap()),
                 outcome,
                 LabelProvenance::Simulated,
                 method,
@@ -100,11 +119,11 @@ mod tests {
         assert!(rows
             .iter()
             .all(|row| row.provenance() == LabelProvenance::Simulated));
-        let (first_fill, first_pnl) = train_demo_models().unwrap();
-        let (second_fill, second_pnl) = train_demo_models().unwrap();
-        assert_eq!(first_fill.bias(), second_fill.bias());
-        assert_eq!(first_fill.weights(), second_fill.weights());
-        assert_eq!(first_pnl.bias(), second_pnl.bias());
-        assert_eq!(first_pnl.weights(), second_pnl.weights());
+        let first = train_demo_quote_model().unwrap();
+        let second = train_demo_quote_model().unwrap();
+        assert_eq!(first.bias(), second.bias());
+        assert_eq!(first.weights(), second.weights());
+        let market = train_demo_market_model().unwrap();
+        assert!(market.bias().is_finite());
     }
 }

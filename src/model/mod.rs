@@ -1,15 +1,15 @@
-//! Fair value, features, reference models, prediction, and selection.
+//! Fair value, features, probability models, and artifacts.
 //!
 //! This layer depends on [`crate::domain`] only. It does not know about
-//! Binance, MMBK, or Parquet.
+//! Binance, MMBK, or Parquet. It does not choose a trading action.
 
-pub mod candidate;
+pub mod calibration;
 pub mod fair_value;
 pub mod feature;
 pub mod fill;
-pub mod pnl;
+pub mod market;
 pub mod prediction;
-pub mod selection;
+pub mod probe;
 
 #[cfg(feature = "artifact")]
 pub mod artifact;

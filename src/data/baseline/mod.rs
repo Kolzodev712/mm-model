@@ -1,6 +1,6 @@
-//! Deterministic historical expected-value baseline.
+//! Descriptive statistics of historical quote outcomes.
 //!
-//! This is separate from the learned fill and conditional-P&L models.
+//! These counts do not choose a quote or a strategy.
 
 pub mod historical;
 

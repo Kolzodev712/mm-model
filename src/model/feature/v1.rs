@@ -1,6 +1,6 @@
 //! Fixed-size decision-time features for the learned baselines.
 //!
-//! Extraction reads [`MarketState`] and [`CandidateQuote`] only. It does not
+//! Extraction reads [`MarketState`] and [`QuoteContext`] only. It does not
 //! see fills, execution prices, or the fair value at a later horizon.
 //!
 //! The reference price in these features is the book-derived estimate stored
@@ -18,7 +18,7 @@
 
 use std::fmt;
 
-use crate::domain::market::{CandidateQuote, MarketState};
+use crate::domain::market::{MarketState, QuoteContext};
 
 /// Schema version stored in model artifacts.
 ///
@@ -122,7 +122,7 @@ impl<const N: usize> FeatureVector<N> {
 /// state and is only read here.
 pub fn extract_features(
     market: &MarketState,
-    quote: &CandidateQuote,
+    quote: &QuoteContext,
 ) -> Result<FeatureVector<FEATURE_COUNT>, FeatureError> {
     let fair = market.fair_value();
     let bid_qty = market.best_bid_quantity();
@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn known_market_matches_definitions() {
         let state = market(2.0, 1.0);
-        let quote = CandidateQuote::new(99.8, 1.0).unwrap();
+        let quote = QuoteContext::new(99.8, 1.0).unwrap();
         let fair = state.fair_value();
         let features = extract_features(&state, &quote).unwrap();
         let values = features.as_array();

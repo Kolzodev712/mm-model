@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "data_root": "./data",
+  "market": {
+    "exchange": "binance_spot",
+    "symbol": "BTCUSDT",
+    "depth": 10,
+    "update_ms": 100,
+    "fair_value": "microprice"
+  },
+  "task": {
+    "mode": "train",
+    "target": {
+      "target": "quote_fill",
+      "horizon_ms": 1000
+    },
+    "history": {
+      "from_unix_ns": 0,
+      "to_unix_ns": 9000000000000000000
+    },
+    "quote_history_path": "quotes/binance/BTCUSDT.parquet",
+    "artifact_path": "models/quote-fill-1s.json",
+    "validation": {
+      "holdout_percent": 20,
+      "min_train_examples": 8,
+      "min_train_positives": 3,
+      "min_train_negatives": 3,
+      "min_holdout_examples": 4,
+      "min_holdout_positives": 2,
+      "min_holdout_negatives": 2
+    }
+  }
+}

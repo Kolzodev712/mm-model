@@ -19,9 +19,13 @@ check: fmt clippy tests
 build:
     cargo build --bin mm_model --features "live,observe,artifact,parquet-storage"
 
-# Run that binary. Edit configuration() to change the experiment.
+# Run that binary. Without MM_CONFIG it loads configs/default.json.
 run:
     cargo run --bin mm_model --features "live,observe,artifact,parquet-storage"
+
+# Run that binary with one JSON config. Example: just run-config configs/collect-btcusdt-2h.json
+run-config path:
+    MM_CONFIG={{path}} cargo run --bin mm_model --features "live,observe,artifact,parquet-storage"
 
 # Build the runtime image. It does not contain historical data.
 docker-build:

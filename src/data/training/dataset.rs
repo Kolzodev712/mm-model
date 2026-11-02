@@ -33,7 +33,7 @@ use crate::data::training::example::{
     DecisionTimeInputs, FillFacts, LabelProvenance, LabelTiming, ObservedOutcome, TrainingExample,
 };
 use crate::domain::book::BookRecord;
-use crate::domain::market::{CandidateQuote, MarketState};
+use crate::domain::market::{MarketState, QuoteContext};
 use crate::domain::outcome::mark_to_fair_pnl;
 use crate::model::fair_value::{FairValueError, FairValueMethod};
 
@@ -43,7 +43,7 @@ use crate::model::fair_value::{FairValueError, FairValueMethod};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QuoteEvent {
     decision_ns: i64,
-    quote: CandidateQuote,
+    quote: QuoteContext,
     provenance: LabelProvenance,
     facts: FillFacts,
 }
@@ -53,7 +53,7 @@ impl QuoteEvent {
     #[must_use]
     pub fn new(
         decision_ns: i64,
-        quote: CandidateQuote,
+        quote: QuoteContext,
         provenance: LabelProvenance,
         facts: FillFacts,
     ) -> Self {
@@ -71,7 +71,7 @@ impl QuoteEvent {
     }
 
     #[must_use]
-    pub fn quote(self) -> CandidateQuote {
+    pub fn quote(self) -> QuoteContext {
         self.quote
     }
 
@@ -421,7 +421,7 @@ mod tests {
     use super::*;
     use crate::data::training::example::{LabelProvenance, ObservedOutcome};
     use crate::domain::book::{BookRecord, BookStamp, Instrument, Level, BOOK_DEPTH};
-    use crate::domain::market::CandidateQuote;
+    use crate::domain::market::QuoteContext;
     use crate::domain::outcome::mark_to_fair_pnl;
     use crate::model::fair_value::FairValueMethod;
 
@@ -465,7 +465,7 @@ mod tests {
     fn filled_quote() -> QuoteEvent {
         QuoteEvent::new(
             1_000,
-            CandidateQuote::new(99.8, 2.0).unwrap(),
+            QuoteContext::new(99.8, 2.0).unwrap(),
             LabelProvenance::Observed,
             FillFacts::Filled {
                 execution_price: 99.8,
@@ -571,7 +571,7 @@ mod tests {
 
     #[test]
     fn mixed_quote_provenance_is_rejected() {
-        let quote = CandidateQuote::new(99.8, 1.0).unwrap();
+        let quote = QuoteContext::new(99.8, 1.0).unwrap();
         let quotes = [
             QuoteEvent::new(1_000, quote, LabelProvenance::Observed, FillFacts::Unfilled),
             QuoteEvent::new(
@@ -599,7 +599,7 @@ mod tests {
         ];
         let quote = QuoteEvent::new(
             10_000,
-            CandidateQuote::new(99.8, 1.0).unwrap(),
+            QuoteContext::new(99.8, 1.0).unwrap(),
             LabelProvenance::Observed,
             FillFacts::Unfilled,
         );

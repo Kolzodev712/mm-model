@@ -1,12 +1,8 @@
-//! Information available before a buy-quote decision.
+//! Decision-time market state and a quote context to condition on.
 //!
-//! These types are the decision-time view. They do not carry fill labels,
-//! execution prices, or the reference price at a future horizon.
-//!
-//! [`MarketState`] stores the top of book and one reference price already
-//! estimated from that touch. Callers do not pass that price in. It is
-//! computed once when the state is built and then reused for every candidate
-//! quote on that snapshot.
+//! These types do not carry fill labels, execution prices, or a future
+//! reference price. [`QuoteContext`] describes a hypothetical or historical
+//! quote whose outcome a model may estimate. It is not an order.
 
 use std::fmt;
 
@@ -102,15 +98,17 @@ impl MarketState {
     }
 }
 
-/// A buy quote that might be sent. Price and size are known before the decision.
+/// Price and quantity of a quote whose outcome is being estimated.
+///
+/// This is a conditioning context, not an instruction to submit an order.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CandidateQuote {
+pub struct QuoteContext {
     price: f64,
     quantity: f64,
 }
 
-impl CandidateQuote {
-    /// Builds a buy quote with a finite positive price and quantity.
+impl QuoteContext {
+    /// Builds a context with a finite positive price and quantity.
     pub fn new(price: f64, quantity: f64) -> Result<Self, MarketInputError> {
         if !price.is_finite() || price <= 0.0 {
             return Err(MarketInputError::InvalidQuotePrice);
@@ -156,8 +154,8 @@ impl fmt::Display for MarketInputError {
             Self::InvalidAskPrice => "best ask price must be finite and positive",
             Self::InvalidBidQuantity => "best bid quantity must be finite and non-negative",
             Self::InvalidAskQuantity => "best ask quantity must be finite and non-negative",
-            Self::InvalidQuotePrice => "candidate quote price must be finite and positive",
-            Self::InvalidQuoteQuantity => "candidate quantity must be finite and positive",
+            Self::InvalidQuotePrice => "quote context price must be finite and positive",
+            Self::InvalidQuoteQuantity => "quote context quantity must be finite and positive",
         };
         f.write_str(message)
     }

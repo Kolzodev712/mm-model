@@ -11,7 +11,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 --user-group mmrunner
 COPY --from=builder /src/target/release/mm_model /usr/local/bin/mm_model
+COPY configs /app/configs
 USER mmrunner
 ENV MM_DATA_ROOT=/data
+ENV MM_CONFIG=/app/configs/default.json
 WORKDIR /home/mmrunner
 ENTRYPOINT ["mm_model"]

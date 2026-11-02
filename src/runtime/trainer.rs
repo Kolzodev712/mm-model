@@ -1,25 +1,26 @@
-//! Offline training over published Parquet books.
+//! Offline training over published book history.
 //!
-//! Reference logistic and linear fits still materialize one sample slice.
-//! The catalog scan itself is one published partition at a time. An open raw
-//! partition is never included. A failed fit does not replace an existing artifact.
+//! Quote-fill training also reads quote outcomes. Market-outcome training does
+//! not. Both fits materialize one window, then use a purged chronological
+//! holdout. A failed fit does not replace an existing artifact.
 
 use std::path::Path;
 
 use crate::data::training::dataset::{build_training_examples, DatasetConfig, QuoteEvent};
 use crate::data::training::example::{LabelProvenance, ObservedOutcome};
 use crate::data::training::history::{BookRange, HistoricalBooks};
+use crate::data::training::market::{build_market_examples, MarketDatasetConfig, MarketExample};
 use crate::data::training::quotes::{QuoteHistory, QuoteRange};
 use crate::domain::book::BookRecord;
-use crate::model::artifact::ModelArtifact;
-use crate::model::artifact::ValidationReport;
+use crate::model::artifact::{
+    log_loss_accepts, ArtifactMetadata, LabelSource, ModelArtifact, ModelFamily, ValidationReport,
+};
+use crate::model::calibration::score_probabilities;
 use crate::model::fair_value::FairValueMethod;
-use crate::model::feature::v1::FEATURE_COUNT;
-use crate::model::fill::LogisticRegression;
-use crate::model::pnl::LinearRegression;
-use crate::model::prediction::predict_quote;
-use crate::model::prediction::TrainConfig;
-use crate::runtime::config::EvidencePolicy;
+use crate::model::feature::market::MARKET_FEATURE_COUNT;
+use crate::model::fill::{FillSample, LogisticRegression};
+use crate::model::prediction::{FillProbabilityModel, TrainConfig};
+use crate::runtime::config::{EvidencePolicy, TrainingTarget};
 
 macro_rules! runtime_info {
     ($($arg:tt)*) => {{
@@ -30,7 +31,7 @@ macro_rules! runtime_info {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrainOutcome {
-    PublishedForShadow { dataset_id: String },
+    Validated { dataset_id: String },
     InsufficientData { reason: String },
     Rejected { reason: String },
     SkippedNoLabels,
@@ -41,23 +42,21 @@ pub struct TrainingWindow {
     pub to_ns: i64,
 }
 
-/// One offline fit. The historical source is separate so storage stays outside the fit.
+/// One offline fit. The book source is separate so storage stays outside the fit.
 pub struct TrainingJob<'a> {
     pub exchange: &'a str,
     pub symbol: &'a str,
     pub method: FairValueMethod,
-    pub horizon_ns: i64,
     pub window: TrainingWindow,
     pub evidence: EvidencePolicy,
     pub artifact_path: &'a Path,
+    pub target: TrainingTarget,
 }
 
-/// Fits the two reference models on books and quotes inside the job window.
+/// Fits the selected probability model.
 ///
-/// The scan visits whatever each source yields. This function then materializes
-/// that window into one `Vec` because the current full-batch fit needs a slice.
-/// It is not a streaming trainer. Callers must pass a book source that already
-/// excludes open, failed, and unpublished partitions.
+/// `quotes` is read only for [`TrainingTarget::QuoteFill`]. Market-outcome
+/// training ignores it, including a missing quote file.
 pub fn train_history<H, Q>(
     history: &H,
     quotes: &Q,
@@ -67,6 +66,49 @@ where
     H: HistoricalBooks,
     Q: QuoteHistory,
 {
+    let books = load_books(history, job)?;
+    match job.target {
+        TrainingTarget::QuoteFill { horizon_ns } => {
+            let loaded = load_quotes(quotes, job)?;
+            if loaded.is_empty() {
+                return Ok(TrainOutcome::SkippedNoLabels);
+            }
+            runtime_info!(
+                books = books.len(),
+                quotes = loaded.len(),
+                "quote-fill window loaded"
+            );
+            fit_quote(&books, &loaded, job, horizon_ns)
+        }
+        TrainingTarget::MarketOutcome(definition) => {
+            runtime_info!(books = books.len(), "market-outcome window loaded");
+            fit_market(&books, job, definition)
+        }
+    }
+}
+
+fn load_books<H: HistoricalBooks>(
+    history: &H,
+    job: &TrainingJob<'_>,
+) -> Result<Vec<BookRecord>, TrainFailure> {
+    let range = BookRange {
+        exchange: job.exchange.to_string(),
+        symbol: job.symbol.to_string(),
+        from_ns: job.window.from_ns,
+        to_ns: job.window.to_ns,
+    };
+    let mut books = Vec::new();
+    history
+        .for_each(&range, |book| books.push(*book))
+        .map_err(|_| TrainFailure::History)?;
+    books.sort_by_key(|book| book.stamp().local_receive_ns);
+    Ok(books)
+}
+
+fn load_quotes<Q: QuoteHistory>(
+    quotes: &Q,
+    job: &TrainingJob<'_>,
+) -> Result<Vec<QuoteEvent>, TrainFailure> {
     let range = QuoteRange {
         exchange: job.exchange.to_string(),
         symbol: job.symbol.to_string(),
@@ -77,44 +119,21 @@ where
     quotes
         .for_each(&range, |quote| loaded.push(*quote))
         .map_err(|_| TrainFailure::Quotes)?;
-    if loaded.is_empty() {
-        return Ok(TrainOutcome::SkippedNoLabels);
-    }
-    let books_range = BookRange {
-        exchange: job.exchange.to_string(),
-        symbol: job.symbol.to_string(),
-        from_ns: job.window.from_ns,
-        to_ns: job.window.to_ns,
-    };
-    let mut books = Vec::new();
-    history
-        .for_each(&books_range, |book| books.push(*book))
-        .map_err(|_| TrainFailure::History)?;
-    books.sort_by_key(|book| book.stamp().local_receive_ns);
-    runtime_info!(
-        books = books.len(),
-        quotes = loaded.len(),
-        "training window loaded"
-    );
-    fit_books(&books, &loaded, job)
+    Ok(loaded)
 }
 
-fn fit_books(
+fn fit_quote(
     books: &[BookRecord],
     quotes: &[QuoteEvent],
     job: &TrainingJob<'_>,
+    horizon_ns: i64,
 ) -> Result<TrainOutcome, TrainFailure> {
-    let method = job.method;
-    let horizon_ns = job.horizon_ns;
-    let window = &job.window;
-    let artifact_path = job.artifact_path;
-    let policy = job.evidence;
     if books.is_empty() {
         return Ok(TrainOutcome::InsufficientData {
             reason: "no published books in the training window".into(),
         });
     }
-    let config = DatasetConfig::new(method, horizon_ns).map_err(|_| TrainFailure::Dataset)?;
+    let config = DatasetConfig::new(job.method, horizon_ns).map_err(|_| TrainFailure::Dataset)?;
     let set = match build_training_examples(books, quotes, config) {
         Ok(set) => set,
         Err(err) => {
@@ -125,213 +144,280 @@ fn fit_books(
     };
     let mut rows = set.examples().to_vec();
     rows.sort_by_key(|row| row.timing().decision_ns);
-    let fills = rows
+    let decisions: Vec<i64> = rows.iter().map(|row| row.timing().decision_ns).collect();
+    let horizons: Vec<i64> = rows
         .iter()
-        .filter(|row| matches!(row.outcome(), ObservedOutcome::Filled { .. }))
-        .count();
-    runtime_info!(examples = rows.len(), fills, "training examples built");
-    let split = match checked_split(&rows, policy) {
+        .map(|row| row.timing().horizon_snapshot_ns)
+        .collect();
+    let split = match checked_split(&decisions, &horizons, job.evidence, |index| {
+        matches!(rows[index].outcome(), ObservedOutcome::Filled { .. })
+    }) {
         Ok(split) => split,
         Err(outcome) => return Ok(outcome),
     };
-    let train_rows = split.train;
-    let holdout_rows = split.holdout;
-    let provenance = train_rows[0].provenance();
+    let provenance = rows[split.train_index[0]].provenance();
     if rows.iter().any(|row| row.provenance() != provenance) {
         return Ok(TrainOutcome::Rejected {
             reason: "mixed label provenance".into(),
         });
     }
-    let train_fills = train_rows
+    let train_rows: Vec<_> = split.train_index.iter().map(|index| rows[*index]).collect();
+    let holdout_rows: Vec<_> = split
+        .holdout_index
         .iter()
-        .filter(|row| matches!(row.outcome(), ObservedOutcome::Filled { .. }))
-        .count();
-    let train_unfilled = train_rows.len() - train_fills;
-    let holdout_fills = holdout_rows
+        .map(|index| rows[*index])
+        .collect();
+    let train =
+        crate::data::training::example::logistic_samples(&train_rows, provenance, job.method)
+            .map_err(|_| TrainFailure::Dataset)?;
+    let holdout =
+        crate::data::training::example::logistic_samples(&holdout_rows, provenance, job.method)
+            .map_err(|_| TrainFailure::Dataset)?;
+    let label_source = match provenance {
+        LabelProvenance::Observed => LabelSource::ObservedQuote,
+        LabelProvenance::Simulated => LabelSource::SimulatedQuote,
+    };
+    finish_fit(FitRequest {
+        job,
+        family: ModelFamily::QuoteFill,
+        horizon_ns,
+        threshold_bps: None,
+        label_source,
+        split: &split,
+        train: &train,
+        holdout: &holdout,
+        raw_rows: rows.len(),
+    })
+}
+
+fn fit_market(
+    books: &[BookRecord],
+    job: &TrainingJob<'_>,
+    definition: crate::model::market::MarketOutcomeDefinition,
+) -> Result<TrainOutcome, TrainFailure> {
+    if books.is_empty() {
+        return Ok(TrainOutcome::InsufficientData {
+            reason: "no published books in the training window".into(),
+        });
+    }
+    let config =
+        MarketDatasetConfig::new(job.method, definition).map_err(|_| TrainFailure::Dataset)?;
+    let mut rows = match build_market_examples(books, config) {
+        Ok(rows) => rows,
+        Err(err) => {
+            return Ok(TrainOutcome::Rejected {
+                reason: err.to_string(),
+            })
+        }
+    };
+    rows.sort_by_key(|row| row.decision_ns);
+    let decisions: Vec<i64> = rows.iter().map(|row| row.decision_ns).collect();
+    let horizons: Vec<i64> = rows.iter().map(|row| row.horizon_snapshot_ns).collect();
+    let split = match checked_split(&decisions, &horizons, job.evidence, |index| {
+        rows[index].up_move
+    }) {
+        Ok(split) => split,
+        Err(outcome) => return Ok(outcome),
+    };
+    let train = samples_from(&rows, &split.train_index);
+    let holdout = samples_from(&rows, &split.holdout_index);
+    finish_fit(FitRequest {
+        job,
+        family: ModelFamily::MarketUpMove,
+        horizon_ns: definition.horizon_ns(),
+        threshold_bps: Some(definition.threshold_bps()),
+        label_source: LabelSource::PublicBook,
+        split: &split,
+        train: &train,
+        holdout: &holdout,
+        raw_rows: rows.len(),
+    })
+}
+
+fn samples_from(
+    rows: &[MarketExample],
+    indexes: &[usize],
+) -> Vec<FillSample<MARKET_FEATURE_COUNT>> {
+    indexes
         .iter()
-        .filter(|row| matches!(row.outcome(), ObservedOutcome::Filled { .. }))
-        .count();
-    let holdout_misses = holdout_rows.len() - holdout_fills;
-    let fill_rows =
-        crate::data::training::example::logistic_samples(&train_rows, provenance, method)
-            .map_err(|_| TrainFailure::Dataset)?;
-    let pnl_rows = crate::data::training::example::pnl_samples(&train_rows, provenance, method)
-        .map_err(|_| TrainFailure::Dataset)?;
-    let holdout_fill =
-        crate::data::training::example::logistic_samples(&holdout_rows, provenance, method)
-            .map_err(|_| TrainFailure::Dataset)?;
-    let holdout_pnl =
-        crate::data::training::example::pnl_samples(&holdout_rows, provenance, method)
-            .map_err(|_| TrainFailure::Dataset)?;
-    let train = TrainConfig {
+        .map(|index| FillSample {
+            features: rows[*index].features,
+            positive: rows[*index].up_move,
+        })
+        .collect()
+}
+
+struct FitRequest<'a, const N: usize> {
+    job: &'a TrainingJob<'a>,
+    family: ModelFamily,
+    horizon_ns: i64,
+    threshold_bps: Option<f64>,
+    label_source: LabelSource,
+    split: &'a ChronoSplit,
+    train: &'a [FillSample<N>],
+    holdout: &'a [FillSample<N>],
+    raw_rows: usize,
+}
+
+fn finish_fit<const N: usize>(request: FitRequest<'_, N>) -> Result<TrainOutcome, TrainFailure> {
+    let FitRequest {
+        job,
+        family,
+        horizon_ns,
+        threshold_bps,
+        label_source,
+        split,
+        train,
+        holdout,
+        raw_rows,
+    } = request;
+    let train_config = TrainConfig {
         learning_rate: 0.2,
         epochs: 200,
     };
-    let mut fill = LogisticRegression::<FEATURE_COUNT>::zeros();
-    let after_fill = fill
-        .train(&fill_rows, train)
+    let mut model = LogisticRegression::<N>::zeros();
+    let after = model
+        .train(train, train_config)
         .map_err(|_| TrainFailure::Fit)?;
-    let mut pnl = LinearRegression::<FEATURE_COUNT>::zeros();
-    let after_pnl = pnl.train(&pnl_rows, train).map_err(|_| TrainFailure::Fit)?;
-    if !after_fill.is_finite() || !after_pnl.is_finite() {
+    if !after.is_finite() {
         return Ok(TrainOutcome::Rejected {
             reason: "reference training produced a non-finite loss".into(),
         });
     }
-    let rate = train_fills as f64 / train_rows.len() as f64;
+    let positives = train.iter().filter(|row| row.positive).count();
+    let rate = positives as f64 / train.len() as f64;
     let logit = (rate / (1.0 - rate)).ln();
-    let fill_baseline =
-        LogisticRegression::<FEATURE_COUNT>::from_weights(logit, [0.0; FEATURE_COUNT])
-            .map_err(|_| TrainFailure::Fit)?;
-    let mean_pnl = val_mean_pnl(&pnl_rows);
-    let pnl_baseline =
-        LinearRegression::<FEATURE_COUNT>::from_weights(mean_pnl, [0.0; FEATURE_COUNT])
-            .map_err(|_| TrainFailure::Fit)?;
-    let learned_fill = fill
-        .mean_loss(&holdout_fill)
-        .map_err(|_| TrainFailure::Fit)?;
-    let learned_pnl = pnl.mean_loss(&holdout_pnl).map_err(|_| TrainFailure::Fit)?;
-    let base_fill = fill_baseline
-        .mean_loss(&holdout_fill)
-        .map_err(|_| TrainFailure::Fit)?;
-    let base_pnl = pnl_baseline
-        .mean_loss(&holdout_pnl)
-        .map_err(|_| TrainFailure::Fit)?;
-    let (ev_model_error, ev_baseline_error) = ev_mae(&fill, &pnl, &holdout_rows, rate * mean_pnl)?;
-    if !learned_fill.is_finite()
-        || !learned_pnl.is_finite()
-        || !ev_model_error.is_finite()
-        || !ev_baseline_error.is_finite()
-        || !crate::model::artifact::losses_accept(
-            learned_fill,
-            base_fill,
-            learned_pnl,
-            base_pnl,
-            ev_model_error,
-            ev_baseline_error,
-        )
+    let baseline =
+        LogisticRegression::<N>::from_weights(logit, [0.0; N]).map_err(|_| TrainFailure::Fit)?;
+    let learned_loss = model.mean_loss(holdout).map_err(|_| TrainFailure::Fit)?;
+    let baseline_loss = baseline.mean_loss(holdout).map_err(|_| TrainFailure::Fit)?;
+    let learned_scores = probability_pairs(&model, holdout)?;
+    let baseline_scores = probability_pairs(&baseline, holdout)?;
+    let learned = score_probabilities(&learned_scores).map_err(|_| TrainFailure::Fit)?;
+    let baseline_metrics = score_probabilities(&baseline_scores).map_err(|_| TrainFailure::Fit)?;
+    if !learned_loss.is_finite()
+        || !baseline_loss.is_finite()
+        || !log_loss_accepts(learned_loss, baseline_loss)
     {
         return Ok(TrainOutcome::Rejected {
-            reason: "holdout did not beat the constant training baselines; combined EV must be strictly better".into(),
+            reason:
+                "holdout log loss is not strictly better than the constant training-rate baseline"
+                    .into(),
         });
     }
-    if provenance != LabelProvenance::Observed {
-        return Ok(TrainOutcome::InsufficientData {
-            reason: "simulated labels are not released for shadow".into(),
-        });
-    }
+    let (train_positives, train_negatives) = counts(train);
+    let (holdout_positives, holdout_negatives) = counts(holdout);
     let report = ValidationReport {
         rows_before_purge: split.rows_before_purge as u64,
         purged_training_rows: split.purged as u64,
-        train_examples: train_rows.len() as u64,
-        holdout_examples: holdout_rows.len() as u64,
+        train_examples: train.len() as u64,
+        holdout_examples: holdout.len() as u64,
         holdout_start_ns: split.holdout_start_ns,
-        train_fills: train_fills as u64,
-        train_misses: train_unfilled as u64,
-        holdout_fills: holdout_fills as u64,
-        holdout_misses: holdout_misses as u64,
-        fill_model_loss: learned_fill,
-        fill_baseline_loss: base_fill,
-        pnl_model_loss: learned_pnl,
-        pnl_baseline_loss: base_pnl,
-        ev_model_error,
-        ev_baseline_error,
+        train_positives,
+        train_negatives,
+        holdout_positives,
+        holdout_negatives,
+        log_loss: learned.log_loss,
+        baseline_log_loss: baseline_metrics.log_loss,
+        brier: learned.brier,
+        baseline_brier: baseline_metrics.brier,
+        calibration: learned.bins,
     };
     let dataset_id = format!(
         "{}-{}-{}-{}-{}",
-        method.name(),
-        window.from_ns,
-        window.to_ns,
-        rows.len(),
-        fills
+        family_name(family),
+        job.method.name(),
+        job.window.from_ns,
+        job.window.to_ns,
+        raw_rows
     );
-    let artifact = ModelArtifact::published_for_shadow(
-        method,
+    let artifact = ModelArtifact::validated(
+        family,
+        job.method,
         horizon_ns,
-        &fill,
-        &pnl,
-        crate::model::artifact::ArtifactMetadata {
-            provenance,
-            window_from_ns: window.from_ns,
-            window_to_ns: window.to_ns,
+        threshold_bps,
+        &model,
+        ArtifactMetadata {
+            label_source,
+            window_from_ns: job.window.from_ns,
+            window_to_ns: job.window.to_ns,
             dataset_id: dataset_id.clone(),
         },
         report,
     )
     .map_err(|_| TrainFailure::Artifact)?;
     artifact
-        .write_json(artifact_path)
+        .write_json(job.artifact_path)
         .map_err(|_| TrainFailure::Artifact)?;
-    runtime_info!(dataset_id = %dataset_id, "model artifact released for shadow");
-    Ok(TrainOutcome::PublishedForShadow { dataset_id })
+    runtime_info!(dataset_id = %dataset_id, "validated model written");
+    Ok(TrainOutcome::Validated { dataset_id })
 }
 
-fn ev_mae(
-    fill: &LogisticRegression<FEATURE_COUNT>,
-    pnl: &LinearRegression<FEATURE_COUNT>,
-    holdout: &[crate::data::training::example::TrainingExample],
-    baseline_ev: f64,
-) -> Result<(f64, f64), TrainFailure> {
-    if holdout.is_empty() || !baseline_ev.is_finite() {
-        return Err(TrainFailure::Fit);
+fn family_name(family: ModelFamily) -> &'static str {
+    match family {
+        ModelFamily::QuoteFill => "quote-fill",
+        ModelFamily::MarketUpMove => "market-up-move",
     }
-    let mut model = 0.0;
-    let mut baseline = 0.0;
-    for row in holdout {
-        let inputs = row.inputs();
-        let market = inputs.market();
-        let quote = inputs.quote();
-        let prediction =
-            predict_quote(&market, &quote, fill, pnl).map_err(|_| TrainFailure::Fit)?;
-        let observed = match row.outcome() {
-            ObservedOutcome::Unfilled => 0.0,
-            ObservedOutcome::Filled { pnl, .. } => pnl,
-        };
-        model += (prediction.expected_value - observed).abs();
-        baseline += (baseline_ev - observed).abs();
-    }
-    let count = holdout.len() as f64;
-    Ok((model / count, baseline / count))
 }
 
-struct PurgedSplit {
+fn counts<const N: usize>(rows: &[FillSample<N>]) -> (u64, u64) {
+    let positives = rows.iter().filter(|row| row.positive).count() as u64;
+    (positives, rows.len() as u64 - positives)
+}
+
+fn probability_pairs<const N: usize>(
+    model: &LogisticRegression<N>,
+    rows: &[FillSample<N>],
+) -> Result<Vec<(f64, bool)>, TrainFailure> {
+    let mut pairs = Vec::with_capacity(rows.len());
+    for row in rows {
+        let probability = model
+            .predict_fill_probability(&row.features)
+            .map_err(|_| TrainFailure::Fit)?
+            .get();
+        pairs.push((probability, row.positive));
+    }
+    Ok(pairs)
+}
+
+struct ChronoSplit {
     holdout_start_ns: i64,
     rows_before_purge: usize,
     purged: usize,
-    train: Vec<crate::data::training::example::TrainingExample>,
-    holdout: Vec<crate::data::training::example::TrainingExample>,
+    train_index: Vec<usize>,
+    holdout_index: Vec<usize>,
 }
 
-/// Sort is the caller's job. Holdout is the last `holdout_percent` of rows by decision time.
-/// A training candidate is dropped when its horizon snapshot is at or after the first holdout decision.
 fn checked_split(
-    rows: &[crate::data::training::example::TrainingExample],
+    decision_ns: &[i64],
+    horizon_ns: &[i64],
     policy: EvidencePolicy,
-) -> Result<PurgedSplit, TrainOutcome> {
-    let Some(split) = purge_holdout(rows, policy.holdout_percent) else {
+    mut is_positive: impl FnMut(usize) -> bool,
+) -> Result<ChronoSplit, TrainOutcome> {
+    let Some(split) = chronological_split(decision_ns, horizon_ns, policy.holdout_percent) else {
         return Err(TrainOutcome::InsufficientData {
             reason: "chronological split produced an empty train or holdout slice".into(),
         });
     };
-    let train_fills = split
-        .train
+    let train_positives = split
+        .train_index
         .iter()
-        .filter(|row| matches!(row.outcome(), ObservedOutcome::Filled { .. }))
+        .filter(|index| is_positive(**index))
         .count();
-    let train_misses = split.train.len() - train_fills;
-    let holdout_fills = split
-        .holdout
+    let train_negatives = split.train_index.len() - train_positives;
+    let holdout_positives = split
+        .holdout_index
         .iter()
-        .filter(|row| matches!(row.outcome(), ObservedOutcome::Filled { .. }))
+        .filter(|index| is_positive(**index))
         .count();
-    let holdout_misses = split.holdout.len() - holdout_fills;
-    if split.train.is_empty()
-        || split.train.len() < policy.min_train_examples
-        || train_fills < policy.min_train_fills
-        || train_misses < policy.min_train_misses
-        || split.holdout.len() < policy.min_holdout_examples
-        || holdout_fills < policy.min_holdout_fills
-        || holdout_misses < policy.min_holdout_misses
+    let holdout_negatives = split.holdout_index.len() - holdout_positives;
+    if split.train_index.is_empty()
+        || split.train_index.len() < policy.min_train_examples
+        || train_positives < policy.min_train_positives
+        || train_negatives < policy.min_train_negatives
+        || split.holdout_index.len() < policy.min_holdout_examples
+        || holdout_positives < policy.min_holdout_positives
+        || holdout_negatives < policy.min_holdout_negatives
     {
         return Err(TrainOutcome::InsufficientData {
             reason: "train or holdout does not meet the evidence policy after purging".into(),
@@ -340,39 +426,40 @@ fn checked_split(
     Ok(split)
 }
 
-fn purge_holdout(
-    rows: &[crate::data::training::example::TrainingExample],
+/// Rows must already be sorted by decision time.
+///
+/// A training candidate is dropped when its horizon snapshot is at or after
+/// the first holdout decision. It is not moved into the holdout.
+fn chronological_split(
+    decision_ns: &[i64],
+    horizon_ns: &[i64],
     holdout_percent: u8,
-) -> Option<PurgedSplit> {
-    let n = rows.len();
+) -> Option<ChronoSplit> {
+    let n = decision_ns.len();
+    if n != horizon_ns.len() {
+        return None;
+    }
     let train_end = n * (100 - u32::from(holdout_percent)) as usize / 100;
     if train_end == 0 || train_end >= n {
         return None;
     }
-    let holdout_start_ns = rows[train_end].timing().decision_ns;
-    let mut train = Vec::new();
+    let holdout_start_ns = decision_ns[train_end];
+    let mut train_index = Vec::new();
     let mut purged = 0usize;
-    for row in &rows[..train_end] {
-        if row.timing().horizon_snapshot_ns >= holdout_start_ns {
+    for (index, horizon) in horizon_ns.iter().enumerate().take(train_end) {
+        if *horizon >= holdout_start_ns {
             purged += 1;
         } else {
-            train.push(*row);
+            train_index.push(index);
         }
     }
-    Some(PurgedSplit {
+    Some(ChronoSplit {
         holdout_start_ns,
         rows_before_purge: train_end,
         purged,
-        train,
-        holdout: rows[train_end..].to_vec(),
+        train_index,
+        holdout_index: (train_end..n).collect(),
     })
-}
-
-fn val_mean_pnl(rows: &[crate::model::pnl::PnlSample<FEATURE_COUNT>]) -> f64 {
-    if rows.is_empty() {
-        return 0.0;
-    }
-    rows.iter().map(|row| row.pnl).sum::<f64>() / rows.len() as f64
 }
 
 #[derive(Debug)]
@@ -402,10 +489,14 @@ impl std::error::Error for TrainFailure {}
 mod tests {
     use super::*;
     use crate::data::training::dataset::QuoteEvent;
-    use crate::data::training::example::{FillFacts, LabelProvenance};
+    use crate::data::training::example::{
+        DecisionTimeInputs, FillFacts, LabelProvenance, LabelTiming, ObservedOutcome,
+        TrainingExample,
+    };
     use crate::data::training::history::MemoryBooks;
     use crate::domain::book::{BookRecord, BookStamp, Instrument, Level, BOOK_DEPTH};
-    use crate::domain::market::CandidateQuote;
+    use crate::domain::market::QuoteContext;
+    use crate::model::market::MarketOutcomeDefinition;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn book(ns: i64) -> BookRecord {
@@ -413,7 +504,7 @@ mod tests {
         let mut asks = [Level::EMPTY; BOOK_DEPTH];
         bids[0] = Level {
             price: 99.9,
-            quantity: 2.0,
+            quantity: 1.0,
         };
         asks[0] = Level {
             price: 100.1,
@@ -434,6 +525,21 @@ mod tests {
         .unwrap()
     }
 
+    fn quote_job(path: &Path) -> TrainingJob<'_> {
+        TrainingJob {
+            exchange: "binance",
+            symbol: "BTCUSDT",
+            method: FairValueMethod::Microprice,
+            window: TrainingWindow {
+                from_ns: 0,
+                to_ns: 5_000,
+            },
+            evidence: EvidencePolicy::default(),
+            artifact_path: path,
+            target: TrainingTarget::QuoteFill { horizon_ns: 500 },
+        }
+    }
+
     #[test]
     fn trainer_uses_the_historical_source_boundary() {
         let books = [book(1_000), book(2_000)];
@@ -444,7 +550,7 @@ mod tests {
         };
         let quote = QuoteEvent::new(
             1_000,
-            CandidateQuote::new(99.8, 1.0).unwrap(),
+            QuoteContext::new(99.8, 1.0).unwrap(),
             LabelProvenance::Simulated,
             FillFacts::Filled {
                 execution_price: 99.8,
@@ -461,23 +567,38 @@ mod tests {
             symbol: "BTCUSDT",
             quotes: &[quote],
         };
-        let outcome = train_history(
-            &history,
-            &quotes,
-            &TrainingJob {
-                exchange: "binance",
-                symbol: "BTCUSDT",
-                method: FairValueMethod::Microprice,
-                horizon_ns: 500,
-                window: TrainingWindow {
-                    from_ns: 0,
-                    to_ns: 5_000,
-                },
-                evidence: EvidencePolicy::default(),
-                artifact_path: &path,
-            },
-        )
-        .unwrap();
+        let outcome = train_history(&history, &quotes, &quote_job(&path)).unwrap();
+        assert!(matches!(outcome, TrainOutcome::InsufficientData { .. }));
+        assert!(!path.is_file());
+    }
+
+    #[test]
+    fn market_training_does_not_read_quote_history() {
+        let books = [book(1_000), book(2_000)];
+        let history = MemoryBooks {
+            exchange: "binance",
+            symbol: "BTCUSDT",
+            books: &books,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "mm-market-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let quotes = crate::data::training::quotes::MemoryQuoteHistory {
+            exchange: "binance",
+            symbol: "BTCUSDT",
+            quotes: &[],
+        };
+        let job = TrainingJob {
+            target: TrainingTarget::MarketOutcome(
+                MarketOutcomeDefinition::new_up_move(500, 1.0).unwrap(),
+            ),
+            ..quote_job(&path)
+        };
+        let outcome = train_history(&history, &quotes, &job).unwrap();
         assert!(matches!(outcome, TrainOutcome::InsufficientData { .. }));
         assert!(!path.is_file());
     }
@@ -491,18 +612,7 @@ mod tests {
             books: &books,
         };
         let path = std::env::temp_dir().join("mm-train-later.json");
-        let job = TrainingJob {
-            exchange: "binance",
-            symbol: "BTCUSDT",
-            method: FairValueMethod::Microprice,
-            horizon_ns: 500,
-            window: TrainingWindow {
-                from_ns: 0,
-                to_ns: 5_000,
-            },
-            evidence: EvidencePolicy::default(),
-            artifact_path: &path,
-        };
+        let job = quote_job(&path);
         let empty = crate::data::training::quotes::MemoryQuoteHistory {
             exchange: "binance",
             symbol: "BTCUSDT",
@@ -514,7 +624,7 @@ mod tests {
         ));
         let quote = QuoteEvent::new(
             1_000,
-            CandidateQuote::new(99.8, 1.0).unwrap(),
+            QuoteContext::new(99.8, 1.0).unwrap(),
             LabelProvenance::Observed,
             FillFacts::Unfilled,
         );
@@ -534,15 +644,12 @@ mod tests {
         horizon_snapshot: i64,
         filled: bool,
         pnl: f64,
-    ) -> crate::data::training::example::TrainingExample {
-        use crate::data::training::example::{
-            DecisionTimeInputs, LabelTiming, ObservedOutcome, TrainingExample,
-        };
+    ) -> TrainingExample {
         let market = FairValueMethod::Microprice
             .derive_top(99.9, 1.0, 100.1, 1.0)
             .unwrap();
         TrainingExample::new(
-            DecisionTimeInputs::new(market, CandidateQuote::new(99.8, 1.0).unwrap()),
+            DecisionTimeInputs::new(market, QuoteContext::new(99.8, 1.0).unwrap()),
             if filled {
                 ObservedOutcome::Filled {
                     pnl,
@@ -563,8 +670,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Ten decisions at 0,100,...,900. A 20% holdout starts at decision 800.
-    fn boundary_rows(crossing_pnl: f64) -> Vec<crate::data::training::example::TrainingExample> {
+    fn boundary_rows(crossing_pnl: f64) -> Vec<TrainingExample> {
         (0..10)
             .map(|index| {
                 let decision = index * 100;
@@ -576,33 +682,44 @@ mod tests {
             .collect()
     }
 
+    fn times(rows: &[TrainingExample]) -> (Vec<i64>, Vec<i64>) {
+        (
+            rows.iter().map(|row| row.timing().decision_ns).collect(),
+            rows.iter()
+                .map(|row| row.timing().horizon_snapshot_ns)
+                .collect(),
+        )
+    }
+
     #[test]
     fn a_label_that_finishes_before_the_holdout_stays_in_training() {
         let rows = boundary_rows(1.0);
-        let split = purge_holdout(&rows, 20).unwrap();
+        let (decision, horizon) = times(&rows);
+        let split = chronological_split(&decision, &horizon, 20).unwrap();
         assert_eq!(split.holdout_start_ns, 800);
-        assert!(split
-            .train
-            .iter()
-            .any(|row| row.timing().decision_ns == 600 && row.timing().horizon_snapshot_ns == 650));
+        assert!(split.train_index.iter().any(|index| {
+            rows[*index].timing().decision_ns == 600
+                && rows[*index].timing().horizon_snapshot_ns == 650
+        }));
     }
 
     #[test]
     fn a_label_that_reaches_the_holdout_is_purged_and_not_moved() {
         let rows = boundary_rows(9.0);
-        let split = purge_holdout(&rows, 20).unwrap();
+        let (decision, horizon) = times(&rows);
+        let split = chronological_split(&decision, &horizon, 20).unwrap();
         assert_eq!(split.purged, 1);
         assert_eq!(split.rows_before_purge, 8);
-        assert_eq!(split.train.len(), 7);
+        assert_eq!(split.train_index.len(), 7);
         assert!(split
-            .train
+            .train_index
             .iter()
-            .all(|row| row.timing().decision_ns != 700));
+            .all(|index| rows[*index].timing().decision_ns != 700));
         assert!(split
-            .holdout
+            .holdout_index
             .iter()
-            .all(|row| row.timing().decision_ns >= 800));
-        assert_eq!(split.holdout.len(), 2);
+            .all(|index| rows[*index].timing().decision_ns >= 800));
+        assert_eq!(split.holdout_index.len(), 2);
     }
 
     #[test]
@@ -615,61 +732,57 @@ mod tests {
         }
         let policy = EvidencePolicy {
             min_train_examples: 3,
-            min_train_fills: 1,
-            min_train_misses: 1,
+            min_train_positives: 1,
+            min_train_negatives: 1,
             min_holdout_examples: 2,
-            min_holdout_fills: 1,
-            min_holdout_misses: 1,
+            min_holdout_positives: 1,
+            min_holdout_negatives: 1,
             ..EvidencePolicy::default()
         };
-        let before = purge_holdout(&rows, policy.holdout_percent).unwrap();
+        let (decision, horizon) = times(&rows);
+        let before = chronological_split(&decision, &horizon, policy.holdout_percent).unwrap();
         assert!(before.rows_before_purge >= policy.min_train_examples);
-        assert!(before.train.len() < policy.min_train_examples);
+        assert!(before.train_index.len() < policy.min_train_examples);
         assert!(matches!(
-            checked_split(&rows, policy),
+            checked_split(&decision, &horizon, policy, |index| matches!(
+                rows[index].outcome(),
+                ObservedOutcome::Filled { .. }
+            )),
             Err(TrainOutcome::InsufficientData { .. })
         ));
+    }
+
+    #[test]
+    fn market_outcome_rows_use_the_same_purge_boundary() {
+        let decisions = [0, 100, 200, 700, 800, 900];
+        let horizons = [50, 150, 250, 800, 850, 950];
+        let split = chronological_split(&decisions, &horizons, 20).unwrap();
+        assert_eq!(split.holdout_start_ns, 800);
+        assert!(!split.train_index.contains(&3));
+        assert_eq!(split.holdout_index, vec![4, 5]);
     }
 
     #[test]
     fn changing_a_purged_rows_holdout_label_does_not_change_the_fitted_slice() {
         let low = boundary_rows(0.1);
         let high = boundary_rows(50.0);
-        let low_split = purge_holdout(&low, 20).unwrap();
-        let high_split = purge_holdout(&high, 20).unwrap();
-        assert_eq!(low_split.train, high_split.train);
-        assert!(low_split
-            .train
+        let (low_d, low_h) = times(&low);
+        let (high_d, high_h) = times(&high);
+        let low_split = chronological_split(&low_d, &low_h, 20).unwrap();
+        let high_split = chronological_split(&high_d, &high_h, 20).unwrap();
+        let low_train: Vec<_> = low_split
+            .train_index
             .iter()
-            .all(|row| row.timing().horizon_snapshot_ns < low_split.holdout_start_ns));
-        let fitted_pnls: Vec<f64> = low_split
-            .train
-            .iter()
-            .filter_map(|row| match row.outcome() {
-                crate::data::training::example::ObservedOutcome::Filled { pnl, .. } => Some(pnl),
-                crate::data::training::example::ObservedOutcome::Unfilled => None,
-            })
+            .map(|index| low[*index])
             .collect();
-        assert!(!fitted_pnls.contains(&50.0));
-        assert!(!fitted_pnls.contains(&0.1));
-    }
-
-    #[test]
-    fn holdout_labels_do_not_enter_the_training_baseline_slice() {
-        let mut rows = boundary_rows(1.0);
-        rows[8] = labeled_row(800, 850, true, 40.0);
-        rows[9] = labeled_row(900, 950, false, 0.0);
-        let split = purge_holdout(&rows, 20).unwrap();
-        let fills: Vec<f64> = split
-            .train
+        let high_train: Vec<_> = high_split
+            .train_index
             .iter()
-            .filter_map(|row| match row.outcome() {
-                crate::data::training::example::ObservedOutcome::Filled { pnl, .. } => Some(pnl),
-                crate::data::training::example::ObservedOutcome::Unfilled => None,
-            })
+            .map(|index| high[*index])
             .collect();
-        assert!(!fills.contains(&40.0));
-        let mean = fills.iter().sum::<f64>() / fills.len() as f64;
-        assert!((mean - 0.25).abs() < 1e-12);
+        assert_eq!(low_train, high_train);
+        assert!(low_split.train_index.iter().all(|index| {
+            low[*index].timing().horizon_snapshot_ns < low_split.holdout_start_ns
+        }));
     }
 }

@@ -161,23 +161,6 @@ impl DurationNanos {
     }
 }
 
-/// Stable index of a learned candidate. Copyable. Not a heap string.
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CandidateId(u16);
-
-impl CandidateId {
-    #[must_use]
-    pub const fn new(id: u16) -> Self {
-        Self(id)
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u16 {
-        self.0
-    }
-}
-
 /// A scalar failed its constructor check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitError {
