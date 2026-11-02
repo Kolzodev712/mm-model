@@ -127,7 +127,6 @@ pub fn publish_partition(
         .cloned()
         .ok_or(ConvertError::Missing)?;
     published.state = PartitionState::Converted;
-    published.parquet_path = Some(final_path.display().to_string());
     published.parquet_count = Some(written.len() as u64);
     published.raw_count = books.len() as u64;
     published.error = None;

@@ -589,26 +589,20 @@ mod tests {
             &[late],
         )
         .unwrap();
-        let mut early_row =
-            PartitionRecord::open(early_id.clone(), &root, early.stamp().local_receive_ns);
+        let mut early_row = PartitionRecord::open(early_id.clone(), early.stamp().local_receive_ns);
         early_row.state = PartitionState::Published;
-        early_row.parquet_path = Some(early_id.parquet_path(&root).display().to_string());
         early_row.end_ns = early.stamp().local_receive_ns;
         early_row.raw_count = 1;
         early_row.parquet_count = Some(1);
-        let mut late_row =
-            PartitionRecord::open(late_id.clone(), &root, late.stamp().local_receive_ns);
+        let mut late_row = PartitionRecord::open(late_id.clone(), late.stamp().local_receive_ns);
         late_row.state = PartitionState::Published;
-        late_row.parquet_path = Some(late_id.parquet_path(&root).display().to_string());
         late_row.end_ns = late.stamp().local_receive_ns;
         let mut open_row = PartitionRecord::open(
             PartitionId::from_receive_ns("binance", "BTCUSDT", open_book.stamp().local_receive_ns)
                 .unwrap(),
-            &root,
             open_book.stamp().local_receive_ns,
         );
         open_row.state = PartitionState::Open;
-        open_row.parquet_path = Some(root.join("ignored.parquet").display().to_string());
         catalog.upsert(early_row);
         catalog.upsert(late_row);
         catalog.upsert(open_row);

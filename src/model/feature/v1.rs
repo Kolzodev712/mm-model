@@ -25,12 +25,12 @@ use crate::domain::market::{CandidateQuote, MarketState};
 /// basis points (`ratio * 10_000`). Version 1 weights are not compatible:
 /// those ratios sit near `1e-4`, and the reference gradient step cannot move
 /// them. A model file from version 1 is rejected.
-pub const FEATURE_SCHEMA_V1: u32 = 2;
+pub const FEATURE_SCHEMA_VERSION: u32 = 2;
 
 /// Multiplier applied to the three price ratios so a basis point is about 1.
 pub const PRICE_RATIO_SCALE: f64 = 10_000.0;
 
-/// Number of features in [`FEATURE_SCHEMA_V1`].
+/// Number of features in [`FEATURE_SCHEMA_VERSION`].
 pub const FEATURE_COUNT: usize = 5;
 
 /// `(fair_value - quote_price) / fair_value`. Dimensionless.
@@ -49,10 +49,12 @@ pub const EXCHANGE_SPREAD: usize = 1;
 /// `(quote_price - best_bid_price) / fair_value`, then scaled to basis points.
 ///
 /// Buy-side distance from the current best bid. Zero joins the touch.
-/// Under midpoint this is an exact linear combination of distance-from-fair
-/// and spread. Under microprice it is determined by those two features and
-/// the quantity imbalance. The weight on this coordinate is not separately
-/// identified. It stays in the row so older comparisons remain explicit.
+/// Under midpoint, fair is halfway across the spread, so this coordinate is
+/// an exact linear combination of distance-from-fair and spread.
+/// Under microprice, `fair - bid` is `spread * (1 + imbalance) / 2`.
+/// That product is not a linear function of spread and imbalance, so a linear
+/// model cannot rebuild this coordinate from the other features. Keeping it
+/// gives the linear model the interaction directly.
 /// Source: candidate price, best bid, and fair value.
 pub const QUOTE_DISTANCE_FROM_BEST_BID: usize = 2;
 
@@ -194,7 +196,7 @@ mod tests {
         );
         assert!((values[TOP_QUANTITY_IMBALANCE] - (1.0 / 3.0)).abs() < 1e-12);
         assert!((values[RELATIVE_CANDIDATE_QUANTITY] - (1.0 / 3.0)).abs() < 1e-12);
-        assert_eq!(FEATURE_SCHEMA_V1, 2);
+        assert_eq!(FEATURE_SCHEMA_VERSION, 2);
         assert!(values.iter().all(|value| value.is_finite()));
     }
 

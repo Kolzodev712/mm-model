@@ -6,7 +6,6 @@
 //! flushes the open hour and leaves it open.
 
 use crate::data::market::source::BookSource;
-use crate::data::training::dataset::QuoteEvent;
 use crate::domain::book::BookRecord;
 use crate::model::fair_value::FairValueMethod;
 use crate::runtime::clock::Clock;
@@ -40,10 +39,9 @@ pub enum OrchestratorError {
     Catalog(ManifestError),
     Source(String),
     /// Conversion is more than two hours behind. Books already written are kept.
-    Backlog,
     Worker,
-    /// CollectAndTrain was started without quote or fill records.
-    NoLabels,
+    /// Train mode was asked to run without a quote-history file.
+    QuoteHistory,
 }
 
 impl std::fmt::Display for OrchestratorError {
@@ -54,13 +52,8 @@ impl std::fmt::Display for OrchestratorError {
             Self::Train(err) => write!(f, "{err}"),
             Self::Catalog(err) => write!(f, "{err}"),
             Self::Source(err) => write!(f, "{err}"),
-            Self::Backlog => {
-                f.write_str("conversion is behind; collection stopped instead of dropping books")
-            }
             Self::Worker => f.write_str("conversion worker stopped unexpectedly"),
-            Self::NoLabels => f.write_str(
-                "CollectAndTrain needs quote and fill records; public books do not provide them",
-            ),
+            Self::QuoteHistory => f.write_str("train mode requires a quote-history file"),
         }
     }
 }
@@ -95,7 +88,6 @@ impl From<ManifestError> for OrchestratorError {
 pub fn run_source<S>(
     config: &AppConfig,
     source: &mut S,
-    quotes: &[QuoteEvent],
     mut should_stop: impl FnMut() -> bool,
 ) -> Result<Vec<TrainOutcome>, OrchestratorError>
 where
@@ -104,12 +96,15 @@ where
 {
     match config.mode {
         RunMode::Train => {
+            if !config.training.quotes_path.is_file() {
+                return Err(OrchestratorError::QuoteHistory);
+            }
             let catalog = Catalog::open(&config.storage.root)?;
-            Ok(vec![train_from(config, &catalog, quotes)?])
+            Ok(vec![train_from(config, &catalog)?])
         }
         RunMode::Shadow => Ok(Vec::new()),
         RunMode::Collect | RunMode::CollectAndTrain => {
-            run_collect(config, source, quotes, &mut should_stop)
+            run_collect(config, source, &mut should_stop)
         }
     }
 }
@@ -117,16 +112,12 @@ where
 fn run_collect<S>(
     config: &AppConfig,
     source: &mut S,
-    quotes: &[QuoteEvent],
     should_stop: &mut impl FnMut() -> bool,
 ) -> Result<Vec<TrainOutcome>, OrchestratorError>
 where
     S: BookSource,
     S::Error: std::fmt::Display,
 {
-    if config.mode == RunMode::CollectAndTrain && quotes.is_empty() {
-        return Err(OrchestratorError::NoLabels);
-    }
     let started = std::time::Instant::now();
     let catalog = Catalog::open(&config.storage.root)?;
     let mut collector = Collector::new(
@@ -135,20 +126,14 @@ where
         config.market.symbol.as_str(),
         config.storage.flush_every,
     );
-    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
     let worker_config = config.clone();
-    let worker_quotes = quotes.to_vec();
     let worker_catalog = collector.shared_catalog();
-    let worker =
-        std::thread::spawn(move || worker_loop(worker_catalog, worker_config, worker_quotes, rx));
+    let worker = std::thread::spawn(move || worker_loop(worker_catalog, worker_config, rx));
     if let Ok(now_ns) = crate::runtime::clock::SystemClock.unix_nanos() {
-        for id in seal_stale_partitions(collector.catalog_mutex(), now_ns) {
-            if tx.send(id).is_err() {
-                let _ = worker.join();
-                return Err(OrchestratorError::Worker);
-            }
-        }
+        let _ = seal_stale_partitions(collector.catalog_mutex(), now_ns);
     }
+    let _ = tx.try_send(());
     let mut failed = None;
     loop {
         if should_stop()
@@ -168,10 +153,15 @@ where
         };
         let Some(book) = book else { break };
         match collector.push(&book) {
-            Ok(Some(closed)) => {
-                if tx.try_send(closed).is_err() {
-                    failed = Some(OrchestratorError::Backlog);
-                    break;
+            Ok(Some(_)) => {
+                if tx.try_send(()).is_err() {
+                    let pending = collector
+                        .catalog_mutex()
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .pending_conversion()
+                        .len();
+                    runtime_info!(pending, "conversion wakeup already pending");
                 }
             }
             Ok(None) => {}
@@ -236,7 +226,6 @@ fn seal_stale_partitions(catalog: &std::sync::Mutex<Catalog>, now_ns: i64) -> Ve
             let mut existing = existing;
             existing.state = crate::storage::partition::PartitionState::Closed;
             existing.raw_count = count;
-            existing.raw_path = path.display().to_string();
             let id = existing.id.clone();
             guard.upsert(existing);
             if guard.save().is_ok() {
@@ -250,23 +239,32 @@ fn seal_stale_partitions(catalog: &std::sync::Mutex<Catalog>, now_ns: i64) -> Ve
 fn worker_loop(
     catalog: std::sync::Arc<std::sync::Mutex<Catalog>>,
     config: AppConfig,
-    quotes: Vec<QuoteEvent>,
-    rx: std::sync::mpsc::Receiver<PartitionId>,
+    rx: std::sync::mpsc::Receiver<()>,
 ) -> Result<Vec<TrainOutcome>, OrchestratorError> {
     let mut trained = Vec::new();
     let mut since_train = 0u32;
-    while let Ok(closed) = rx.recv() {
-        match publish_partition(&catalog, &closed, ParquetConfig::default()) {
-            Ok(()) => since_train += 1,
-            Err(ConvertError::StillOpen | ConvertError::Ambiguous | ConvertError::Missing) => {
-                return Err(ConvertError::Ambiguous.into());
-            }
-            Err(ConvertError::Manifest(err)) => return Err(err.into()),
-            Err(err) => {
-                runtime_error!(error = %err, "partition conversion failed");
-                continue;
+    while rx.recv().is_ok() {
+        while rx.try_recv().is_ok() {}
+        let pending = {
+            let guard = catalog.lock().unwrap_or_else(|err| err.into_inner());
+            let pending = guard.pending_conversion();
+            runtime_info!(backlog = pending.len(), "conversion worker woke");
+            pending
+        };
+        let mut published = 0u32;
+        for id in pending {
+            match publish_partition(&catalog, &id, ParquetConfig::default()) {
+                Ok(()) => published += 1,
+                Err(ConvertError::StillOpen | ConvertError::Ambiguous | ConvertError::Missing) => {
+                    return Err(ConvertError::Ambiguous.into());
+                }
+                Err(ConvertError::Manifest(err)) => return Err(err.into()),
+                Err(err) => {
+                    runtime_error!(error = %err, "partition conversion failed");
+                }
             }
         }
+        since_train += published;
         if config.mode != RunMode::CollectAndTrain {
             continue;
         }
@@ -280,7 +278,7 @@ fn worker_loop(
             let guard = catalog.lock().unwrap_or_else(|err| err.into_inner());
             guard.clone()
         };
-        match train_from(&config, &snapshot, &quotes) {
+        match train_from(&config, &snapshot) {
             Ok(outcome) => {
                 runtime_info!("training cycle finished");
                 trained.push(outcome);
@@ -294,37 +292,42 @@ fn worker_loop(
     Ok(trained)
 }
 
-fn train_from(
-    config: &AppConfig,
-    catalog: &Catalog,
-    quotes: &[QuoteEvent],
-) -> Result<TrainOutcome, TrainFailure> {
+fn train_from(config: &AppConfig, catalog: &Catalog) -> Result<TrainOutcome, TrainFailure> {
     let history = ParquetHistory::new(catalog);
+    let quotes = crate::storage::quotes::ParquetQuoteHistory {
+        path: config.training.quotes_path.clone(),
+        exchange: config.market.exchange.as_str().to_string(),
+        symbol: config.market.symbol.as_str().to_string(),
+    };
     train_history(
         &history,
+        &quotes,
         &TrainingJob {
             exchange: config.market.exchange.as_str(),
             symbol: config.market.symbol.as_str(),
-            quotes,
             method: config.market.fair_value,
             horizon_ns: config.training.horizon_ns,
             window: crate::runtime::trainer::TrainingWindow {
                 from_ns: config.training.window_from_ns,
                 to_ns: config.training.window_to_ns,
             },
+            evidence: config.training.evidence,
             artifact_path: &config.training.artifact_path,
         },
     )
+    .map_err(|err| match err {
+        TrainFailure::Quotes => TrainFailure::Quotes,
+        other => other,
+    })
 }
 
 /// Books already in memory. Used by tests and by a replay that is not live.
 pub fn run_books(
     config: &AppConfig,
     books: &[BookRecord],
-    quotes: &[QuoteEvent],
 ) -> Result<Vec<TrainOutcome>, OrchestratorError> {
     let mut source = crate::data::market::source::SliceSource::new(books.to_vec());
-    run_source(config, &mut source, quotes, || false)
+    run_source(config, &mut source, || false)
 }
 
 /// Shadow prediction does not write partitions or change weights.
@@ -423,12 +426,15 @@ mod tests {
                 window_to_ns: i64::MAX / 4,
                 trigger: TrainingTrigger::EveryPublishedPartitions(1),
                 artifact_path: root.join("models/current.json"),
+                quotes_path: root.join("quotes/binance/BTCUSDT.parquet"),
+                evidence: crate::runtime::config::EvidencePolicy::default(),
             },
             shadow: ShadowConfig {
                 quantity: 1.0,
                 offsets_bps: "1,5".into(),
                 demo_model: true,
                 model_path: root.join("models/current.json"),
+                report_every: std::time::Duration::from_secs(5),
             },
             run_for: None,
         }
@@ -460,12 +466,15 @@ mod tests {
                 fees: 0.0,
             },
         );
-        let outcomes = run_books(
-            &config(&root, RunMode::CollectAndTrain),
-            &[early, later, next_hour],
+        let cfg = config(&root, RunMode::CollectAndTrain);
+        crate::storage::quotes::write_quotes(
+            &cfg.training.quotes_path,
+            "binance",
+            "BTCUSDT",
             &[quote],
         )
         .unwrap();
+        let outcomes = run_books(&cfg, &[early, later, next_hour]).unwrap();
         assert!(matches!(
             outcomes.first(),
             Some(TrainOutcome::InsufficientData { .. })
@@ -478,7 +487,7 @@ mod tests {
             .all(|row| row.state == PartitionState::Published));
         assert!(published
             .iter()
-            .all(|row| { row.parquet_path.as_deref().unwrap().ends_with(".parquet") }));
+            .all(|row| row.id.parquet_path(&root).is_file()));
         let again_catalog = std::sync::Mutex::new(Catalog::open(&root).unwrap());
         crate::runtime::converter::publish_partition(
             &again_catalog,
@@ -542,22 +551,35 @@ mod tests {
             }
         }
         let root = temp();
-        let outcome = run_source(
-            &config(&root, RunMode::Train),
-            &mut ClosedSource,
-            &[],
-            || false,
-        )
-        .unwrap();
-        assert_eq!(outcome, vec![TrainOutcome::SkippedNoLabels]);
+        let err =
+            run_source(&config(&root, RunMode::Train), &mut ClosedSource, || false).unwrap_err();
+        assert!(matches!(err, OrchestratorError::QuoteHistory));
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn collect_and_train_without_labels_is_an_error() {
+    fn collect_and_train_without_labels_keeps_collecting() {
         let root = temp();
-        let err = run_books(&config(&root, RunMode::CollectAndTrain), &[], &[]).unwrap_err();
-        assert!(matches!(err, OrchestratorError::NoLabels));
+        let hour = 1_793_624_400_000_000_000i64;
+        let outcomes = run_books(
+            &config(&root, RunMode::CollectAndTrain),
+            &[
+                book(hour, 99.9, 100.1),
+                book(hour + 3_600_000_000_000, 100.0, 100.2),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            outcomes.first(),
+            Some(TrainOutcome::SkippedNoLabels)
+        ));
+        let catalog = Catalog::open(&root).unwrap();
+        assert_eq!(
+            catalog
+                .published_overlapping("binance", "BTCUSDT", 0, i64::MAX / 4)
+                .len(),
+            1
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -576,14 +598,14 @@ mod tests {
             let mut writer = crate::storage::raw::BookLogWriter::open(&path, 1).unwrap();
             writer.write(&sample).unwrap();
             writer.close().unwrap();
-            let mut row = crate::storage::partition::PartitionRecord::open(id, &root, ns);
+            let mut row = crate::storage::partition::PartitionRecord::open(id, ns);
             row.state = PartitionState::Closed;
             row.raw_count = 1;
             row.end_ns = ns;
             catalog.upsert(row);
         }
         catalog.save().unwrap();
-        run_books(&config(&root, RunMode::Collect), &[], &[]).unwrap();
+        run_books(&config(&root, RunMode::Collect), &[]).unwrap();
         let catalog = Catalog::open(&root).unwrap();
         assert_eq!(
             catalog
@@ -651,6 +673,13 @@ mod tests {
                 fees: 0.0,
             },
         );
+        crate::storage::quotes::write_quotes(
+            &cfg.training.quotes_path,
+            "binance",
+            "BTCUSDT",
+            &[quote],
+        )
+        .unwrap();
         let outcomes = run_books(
             &cfg,
             &[
@@ -658,7 +687,6 @@ mod tests {
                 book(hour + 2_000, 99.9, 100.1),
                 book(hour + 3_600_000_000_000, 100.0, 100.2),
             ],
-            &[quote],
         )
         .unwrap();
         assert!(matches!(
@@ -702,7 +730,7 @@ mod tests {
             policy,
         )
         .unwrap();
-        let outcomes = run_source(&cfg, &mut client, &[], || false).unwrap();
+        let outcomes = run_source(&cfg, &mut client, || false).unwrap();
         assert!(outcomes.is_empty());
         let catalog = Catalog::open(&root).unwrap();
         assert_eq!(
@@ -724,7 +752,6 @@ mod tests {
                 book(hour, 99.9, 100.1),
                 book(hour + 3_600_000_000_000, 100.0, 100.2),
             ],
-            &[],
         )
         .unwrap();
         assert!(outcomes.is_empty());
@@ -734,12 +761,8 @@ mod tests {
     #[test]
     fn shadow_mode_does_not_publish_partitions() {
         let root = temp();
-        let outcomes = run_books(
-            &config(&root, RunMode::Shadow),
-            &[book(10, 99.9, 100.1)],
-            &[],
-        )
-        .unwrap();
+        let outcomes =
+            run_books(&config(&root, RunMode::Shadow), &[book(10, 99.9, 100.1)]).unwrap();
         assert!(outcomes.is_empty());
         assert!(!root.join("manifest.json").exists());
         let _ = std::fs::remove_dir_all(&root);

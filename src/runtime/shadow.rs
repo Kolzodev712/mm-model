@@ -108,6 +108,137 @@ where
     })
 }
 
+/// Live shadow loop. Logged numbers are predictions, not realized fills or P&L.
+#[cfg(feature = "live")]
+pub fn run_live<C: crate::runtime::clock::Clock>(
+    config: &crate::runtime::config::AppConfig,
+    client: &mut crate::data::market::binance::client::BinanceBookClient<C>,
+    fill: &crate::model::fill::LogisticRegression<FEATURE_COUNT>,
+    pnl: &crate::model::pnl::LinearRegression<FEATURE_COUNT>,
+    should_stop: &impl Fn() -> bool,
+) -> Result<crate::runtime::stats::RunStats, ShadowRunError> {
+    use crate::data::market::source::BookSource;
+    let grid =
+        crate::model::candidate::BpsGrid::parse(&config.shadow.offsets_bps, config.shadow.quantity)
+            .map_err(ShadowRunError::Grid)?;
+    let mut candidates = [empty_slot(); MAX_CANDIDATES];
+    let mut predictions = [empty_prediction(); MAX_CANDIDATES];
+    let mut stats = crate::runtime::stats::RunStats::default();
+    let started = std::time::Instant::now();
+    let mut last_report = std::time::Duration::ZERO;
+    let mut latest = None;
+    while !should_stop() && config.run_for.is_none_or(|limit| started.elapsed() < limit) {
+        match client.next_book() {
+            Err(err) if client.is_idle(&err) => continue,
+            Err(err) => return Err(ShadowRunError::Client(err)),
+            Ok(None) => break,
+            Ok(Some(book)) => {
+                let tick = std::time::Instant::now();
+                match evaluate_book(
+                    &book,
+                    config.market.fair_value,
+                    &grid,
+                    fill,
+                    pnl,
+                    &mut candidates,
+                    &mut predictions,
+                ) {
+                    Ok(result) => {
+                        let latency_ns = tick.elapsed().as_nanos();
+                        latest = Some((
+                            result.best_bid,
+                            result.best_ask,
+                            result.fair_value,
+                            result.choice,
+                        ));
+                        stats.record_book(crate::runtime::stats::BookOutcome {
+                            choice: result.choice,
+                            selected: result.selected,
+                            candidate_count: result.candidate_count,
+                            best_bid: result.best_bid,
+                            best_ask: result.best_ask,
+                            fair_value: result.fair_value,
+                            latency_ns,
+                        });
+                        #[cfg(feature = "observe")]
+                        tracing::debug!(fair = result.fair_value, decision = ?result.choice, "shadow book");
+                    }
+                    Err(_) => stats.record_model_error(),
+                }
+            }
+        }
+        stats.reconnects = client.reconnects();
+        if started.elapsed().saturating_sub(last_report) >= config.shadow.report_every {
+            log_shadow_progress(&stats, latest);
+            last_report = started.elapsed();
+        }
+    }
+    stats.reconnects = client.reconnects();
+    log_shadow_progress(&stats, latest);
+    #[cfg(feature = "observe")]
+    tracing::info!(
+        "shadow summary is predicted probability, conditional P&L, and EV, not realized trading results"
+    );
+    Ok(stats)
+}
+
+#[cfg(feature = "live")]
+fn log_shadow_progress(
+    stats: &crate::runtime::stats::RunStats,
+    latest: Option<(f64, f64, f64, LearnedChoice)>,
+) {
+    #[cfg(feature = "observe")]
+    tracing::info!(
+        books = stats.books_processed,
+        rejected = stats.books_rejected,
+        model_errors = stats.model_errors,
+        reconnects = stats.reconnects,
+        latest = ?latest,
+        mean_predicted_probability = ?stats.mean_selected_probability(),
+        mean_predicted_conditional_pnl = ?stats.mean_selected_conditional_pnl(),
+        mean_predicted_ev = ?stats.mean_selected_ev(),
+        mean_latency_ns = ?stats.mean_latency_ns(),
+        "shadow progress; these are predictions, not realized fills or P&L"
+    );
+}
+
+#[cfg(feature = "live")]
+fn empty_slot() -> CandidateSlot {
+    CandidateSlot {
+        id: CandidateId::new(0),
+        quote: crate::domain::market::CandidateQuote::new(1.0, 1.0).expect("placeholder quote"),
+    }
+}
+
+#[cfg(feature = "live")]
+fn empty_prediction() -> QuotePrediction {
+    QuotePrediction {
+        fill_probability: crate::domain::units::Probability::new(0.0).expect("zero"),
+        expected_pnl_if_filled: crate::domain::units::Pnl::new(0.0).expect("zero"),
+        expected_value: 0.0,
+    }
+}
+
+#[cfg(feature = "live")]
+#[derive(Debug)]
+pub enum ShadowRunError {
+    Client(crate::data::market::binance::client::ClientError),
+    Grid(crate::model::candidate::CandidateError),
+}
+
+#[cfg(feature = "live")]
+impl std::fmt::Display for ShadowRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client(err) => write!(f, "{err}"),
+            Self::Grid(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+#[cfg(feature = "live")]
+impl std::error::Error for ShadowRunError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

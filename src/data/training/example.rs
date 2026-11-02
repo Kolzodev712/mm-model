@@ -20,6 +20,11 @@ use crate::model::pnl::PnlSample;
 
 /// Where a fill label came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "artifact",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
 pub enum LabelProvenance {
     /// The quote was submitted and the outcome was observed.
     Observed,

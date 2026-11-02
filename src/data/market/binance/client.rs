@@ -33,6 +33,8 @@ pub enum ClientError {
     ReconnectExhausted,
     /// The socket had no frame before the read timeout. The caller should poll again.
     Timeout,
+    /// A required socket timeout could not be set.
+    SocketOption,
 }
 
 impl std::fmt::Display for ClientError {
@@ -43,6 +45,7 @@ impl std::fmt::Display for ClientError {
             Self::Malformed => "binance book message was malformed",
             Self::ReconnectExhausted => "binance reconnect attempts were exhausted",
             Self::Timeout => "binance read timed out",
+            Self::SocketOption => "binance socket timeout could not be configured",
         };
         f.write_str(message)
     }
@@ -76,7 +79,7 @@ impl<C: Clock> BinanceBookClient<C> {
         let instrument =
             Instrument::new(BINANCE_EXCHANGE, &symbol).map_err(|_| ClientError::Config)?;
         let mut socket = open_socket(&url)?;
-        apply_timeouts(&mut socket);
+        apply_timeouts(&mut socket)?;
         Ok(Self {
             url,
             clock,
@@ -145,7 +148,7 @@ impl<C: Clock> BinanceBookClient<C> {
             thread::sleep(wait);
             match open_socket(&self.url) {
                 Ok(mut socket) => {
-                    apply_timeouts(&mut socket);
+                    apply_timeouts(&mut socket)?;
                     self.socket = socket;
                     return Ok(());
                 }
@@ -205,15 +208,18 @@ fn is_timeout(err: &tungstenite::Error) -> bool {
     }
 }
 
-fn apply_timeouts(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
+fn apply_timeouts(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> Result<(), ClientError> {
     let timeout = Some(Duration::from_secs(2));
     let tcp = match socket.get_mut() {
         MaybeTlsStream::Plain(tcp) => tcp,
         MaybeTlsStream::Rustls(tls) => tls.get_mut(),
-        _ => return,
+        _ => return Err(ClientError::SocketOption),
     };
-    let _ = tcp.set_read_timeout(timeout);
-    let _ = tcp.set_write_timeout(timeout);
+    tcp.set_read_timeout(timeout)
+        .map_err(|_| ClientError::SocketOption)?;
+    tcp.set_write_timeout(timeout)
+        .map_err(|_| ClientError::SocketOption)?;
+    Ok(())
 }
 
 fn open_socket(url: &str) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, ClientError> {

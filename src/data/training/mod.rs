@@ -6,3 +6,4 @@
 pub mod dataset;
 pub mod example;
 pub mod history;
+pub mod quotes;

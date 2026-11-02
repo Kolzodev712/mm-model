@@ -15,6 +15,11 @@ use std::fmt;
 /// The formulas themselves live with the model. This enum is only the choice
 /// recorded on a market state, a training row, or an artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(
+    feature = "artifact",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
 pub enum FairValueMethod {
     /// `(best_bid + best_ask) / 2`.
     Midpoint,

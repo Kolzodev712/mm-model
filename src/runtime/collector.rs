@@ -45,7 +45,7 @@ impl Collector {
             catalog: Arc::new(Mutex::new(catalog)),
             exchange: exchange.into(),
             symbol: symbol.into(),
-            flush_every: flush_every.max(1),
+            flush_every,
             open: None,
         }
     }
@@ -130,8 +130,7 @@ impl Collector {
                 existing.end_ns.max(start_ns),
             )
         } else {
-            let mut record = PartitionRecord::open(id.clone(), catalog.root(), start_ns);
-            record.raw_path = path.display().to_string();
+            let record = PartitionRecord::open(id.clone(), start_ns);
             catalog.upsert(record);
             catalog.save()?;
             (start_ns, start_ns)
@@ -156,10 +155,6 @@ impl Collector {
         let raw_count = open.count;
         let start_ns = open.start_ns;
         let end_ns = open.end_ns;
-        let path = {
-            let catalog = self.guard();
-            id.raw_path(catalog.root())
-        };
         open.writer.close()?;
         let mut catalog = self.guard();
         if let Some(row) = catalog.get(&id).cloned() {
@@ -168,7 +163,6 @@ impl Collector {
             row.raw_count = raw_count;
             row.start_ns = start_ns;
             row.end_ns = end_ns;
-            row.raw_path = path.display().to_string();
             catalog.upsert(row);
             catalog.save()?;
         }

@@ -8,3 +8,5 @@ pub mod manifest;
 pub mod parquet;
 #[cfg(feature = "parquet-storage")]
 pub mod partition;
+#[cfg(feature = "parquet-storage")]
+pub mod quotes;

@@ -124,17 +124,16 @@ model does not know about Binance or Parquet. Training reads books through
 
 `Collect` writes raw partitions and publishes Parquet. It does not fit a model.
 
-`Train` reads published Parquet inside the configured window and writes an
-artifact when the reference fit reduces loss and sees at least one fill. It
-does not open a websocket.
+`Train` reads published book Parquet and the separate quote/fill Parquet file
+named by configuration. It does not open a websocket. Public books are not
+fill labels. A missing quote file is an error. An empty quote file skips the fit.
 
-`CollectAndTrain` collects, converts each closed hour, and fits after every
-newly published partition (`TrainingTrigger::EveryPublishedPartitions`).
-Collection and training are separate functions. In this build they run on one
-thread, so collection pauses during conversion and training. A failed
-conversion marks that partition `Failed` and collection continues. A failed
-fit keeps the previous artifact. A manifest that cannot be saved stops the
-state change.
+`CollectAndTrain` keeps collecting when no quote file exists yet. A later
+training cycle reads whatever quote history is on disk at that moment. Closed
+hours are recorded in the manifest. The worker is woken by a one-slot channel;
+a full channel means the worker is already scheduled, and it scans the manifest
+for every pending hour. A failed conversion marks that hour `Failed` and
+collection continues. A failed fit keeps the previous artifact.
 
 `Shadow` scores the live book and logs a quote or `NoQuote`. It does not write
 partitions, send orders, or change weights. The default configuration uses the

@@ -10,9 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use super::partition::{PartitionId, PartitionRecord, PartitionState};
 
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestFile {
     version: u32,
     partitions: Vec<PartitionRecord>,
@@ -50,11 +51,6 @@ impl Catalog {
                 || !component_ok(&row.id.symbol)
                 || !day_ok(&row.id.day)
                 || row.id.hour > 23
-                || stored_path_rejected(&root, &row.raw_path)
-                || row
-                    .parquet_path
-                    .as_ref()
-                    .is_some_and(|path| stored_path_rejected(&root, path))
             {
                 return Err(ManifestError::Corrupt);
             }
@@ -70,6 +66,26 @@ impl Catalog {
     #[must_use]
     pub fn records(&self) -> &[PartitionRecord] {
         &self.file.partitions
+    }
+
+    /// Hours waiting for conversion, oldest first. The channel is only a wakeup.
+    pub fn pending_conversion(&self) -> Vec<PartitionId> {
+        let mut rows: Vec<_> = self
+            .file
+            .partitions
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.state,
+                    PartitionState::Closed | PartitionState::Validated | PartitionState::Converted
+                )
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| {
+            (&left.id.day, left.id.hour).cmp(&(&right.id.day, right.id.hour))
+        });
+        rows.into_iter().map(|row| row.id).collect()
     }
 
     pub fn upsert(&mut self, record: PartitionRecord) {
@@ -97,7 +113,8 @@ impl Catalog {
         from_ns: i64,
         to_ns: i64,
     ) -> Vec<PartitionRecord> {
-        self.file
+        let mut rows: Vec<_> = self
+            .file
             .partitions
             .iter()
             .filter(|row| {
@@ -107,7 +124,11 @@ impl Catalog {
                     && row.overlaps(from_ns, to_ns)
             })
             .cloned()
-            .collect()
+            .collect();
+        rows.sort_by(|left, right| {
+            (&left.id.day, left.id.hour).cmp(&(&right.id.day, right.id.hour))
+        });
+        rows
     }
 
     pub fn save(&self) -> Result<(), ManifestError> {
@@ -166,17 +187,6 @@ fn day_ok(value: &str) -> bool {
             .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
 }
 
-fn stored_path_rejected(root: &Path, path: &str) -> bool {
-    if path.is_empty() || path.contains('\0') {
-        return true;
-    }
-    if path.split(['/', '\\']).any(|part| part == "..") {
-        return true;
-    }
-    let candidate = Path::new(path);
-    candidate.is_absolute() && !candidate.starts_with(root)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestError {
     Io,
@@ -204,7 +214,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn absolute_path_outside_the_data_root_is_rejected() {
+    fn old_manifest_version_and_unknown_fields_are_rejected() {
         let root = std::env::temp_dir().join(format!(
             "mm-manifest-{}",
             std::time::SystemTime::now()
@@ -213,22 +223,17 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
-        let body = r#"{
-            "version": 1,
-            "partitions": [{
-                "id": {"exchange":"binance","symbol":"BTCUSDT","day":"2026-11-02","hour":13},
-                "state": "published",
-                "raw_path": "/etc/passwd",
-                "parquet_path": "/tmp/not-in-this-root.parquet",
-                "raw_count": 0,
-                "parquet_count": null,
-                "schema_version": 1,
-                "start_ns": 0,
-                "end_ns": 1,
-                "error": null
-            }]
-        }"#;
-        fs::write(root.join("manifest.json"), body).unwrap();
+        fs::write(
+            root.join("manifest.json"),
+            r#"{"version":1,"partitions":[]}"#,
+        )
+        .unwrap();
+        assert!(matches!(Catalog::open(&root), Err(ManifestError::Version)));
+        fs::write(
+            root.join("manifest.json"),
+            r#"{"version":2,"partitions":[],"raw_path":"/etc/passwd"}"#,
+        )
+        .unwrap();
         assert!(matches!(Catalog::open(&root), Err(ManifestError::Corrupt)));
         let _ = fs::remove_dir_all(&root);
     }

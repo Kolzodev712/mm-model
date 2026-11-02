@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::book::BookRecord;
 
-pub const PARTITION_SCHEMA_VERSION: u32 = 1;
+pub const PARTITION_SCHEMA_VERSION: u32 = 2;
 
 /// Lifecycle of one hour of captured books.
 ///
 /// Training may read only [`PartitionState::Published`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PartitionState {
     Open,
     Closed,
@@ -32,6 +32,7 @@ impl PartitionState {
 
 /// Stable id for one UTC hour of one symbol.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartitionId {
     pub exchange: String,
     pub symbol: String,
@@ -86,11 +87,10 @@ impl PartitionId {
 
 /// Catalog row for one partition.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartitionRecord {
     pub id: PartitionId,
     pub state: PartitionState,
-    pub raw_path: String,
-    pub parquet_path: Option<String>,
     pub raw_count: u64,
     pub parquet_count: Option<u64>,
     pub schema_version: u32,
@@ -100,10 +100,8 @@ pub struct PartitionRecord {
 }
 
 impl PartitionRecord {
-    pub fn open(id: PartitionId, root: &Path, start_ns: i64) -> Self {
+    pub fn open(id: PartitionId, start_ns: i64) -> Self {
         Self {
-            raw_path: id.raw_path(root).display().to_string(),
-            parquet_path: None,
             id,
             state: PartitionState::Open,
             raw_count: 0,
