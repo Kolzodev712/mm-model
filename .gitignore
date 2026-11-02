@@ -1,1 +1,4 @@
 /target
+
+# Local experiment storage: raw books, Parquet history, and derived artifacts.
+/data/
