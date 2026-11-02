@@ -16,7 +16,7 @@ use crate::model::fill::LogisticRegression;
 use crate::model::pnl::LinearRegression;
 use crate::model::prediction::InvalidWeights;
 
-pub const ARTIFACT_VERSION: u32 = 2;
+pub const ARTIFACT_VERSION: u32 = 3;
 
 /// Holdout comparison that was good enough to release for shadow experiments.
 ///
@@ -35,8 +35,15 @@ pub enum ArtifactState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationReport {
+    /// Rows whose decision time was before the holdout, before purging.
+    pub rows_before_purge: u64,
+    /// Training rows removed because `horizon_snapshot_ns` reached the holdout.
+    pub purged_training_rows: u64,
+    /// `rows_before_purge - purged_training_rows`. This is the fitted sample.
     pub train_examples: u64,
     pub holdout_examples: u64,
+    /// Decision time of the first holdout row. Training labels must finish before this.
+    pub holdout_start_ns: i64,
     pub train_fills: u64,
     pub train_misses: u64,
     pub holdout_fills: u64,
@@ -227,6 +234,18 @@ impl ModelArtifact {
     }
 }
 
+/// Fill and conditional P&L may tie their constant baselines. Combined EV must be strictly better.
+pub fn losses_accept(
+    fill_model: f64,
+    fill_baseline: f64,
+    pnl_model: f64,
+    pnl_baseline: f64,
+    ev_model: f64,
+    ev_baseline: f64,
+) -> bool {
+    fill_model <= fill_baseline && pnl_model <= pnl_baseline && ev_model < ev_baseline
+}
+
 fn report_is_acceptable(report: &ValidationReport) -> bool {
     let losses = [
         report.fill_model_loss,
@@ -236,16 +255,23 @@ fn report_is_acceptable(report: &ValidationReport) -> bool {
         report.ev_model_error,
         report.ev_baseline_error,
     ];
-    report.train_examples > 0
+    report.rows_before_purge >= report.purged_training_rows
+        && report.train_examples == report.rows_before_purge - report.purged_training_rows
+        && report.train_examples > 0
         && report.holdout_examples > 0
         && report.train_fills > 0
         && report.train_misses > 0
         && report.holdout_fills > 0
         && report.holdout_misses > 0
         && losses.iter().all(|value| value.is_finite())
-        && report.fill_model_loss <= report.fill_baseline_loss
-        && report.pnl_model_loss <= report.pnl_baseline_loss
-        && report.ev_model_error <= report.ev_baseline_error
+        && losses_accept(
+            report.fill_model_loss,
+            report.fill_baseline_loss,
+            report.pnl_model_loss,
+            report.pnl_baseline_loss,
+            report.ev_model_error,
+            report.ev_baseline_error,
+        )
 }
 
 impl From<InvalidWeights> for ArtifactError {
@@ -295,8 +321,11 @@ mod tests {
 
     fn passing_report() -> ValidationReport {
         ValidationReport {
+            rows_before_purge: 16,
+            purged_training_rows: 0,
             train_examples: 16,
             holdout_examples: 4,
+            holdout_start_ns: 1_000,
             train_fills: 4,
             train_misses: 4,
             holdout_fills: 2,
@@ -365,5 +394,37 @@ mod tests {
             ArtifactError::Json
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_tie_with_the_constant_ev_baseline_is_not_published() {
+        let (fill, pnl) = crate::data::synthetic::train_demo_models().unwrap();
+        let mut report = passing_report();
+        report.ev_model_error = report.ev_baseline_error;
+        assert!(!losses_accept(
+            report.fill_model_loss,
+            report.fill_baseline_loss,
+            report.pnl_model_loss,
+            report.pnl_baseline_loss,
+            report.ev_model_error,
+            report.ev_baseline_error,
+        ));
+        assert_eq!(
+            ModelArtifact::published_for_shadow(
+                FairValueMethod::Microprice,
+                1_000,
+                &fill,
+                &pnl,
+                ArtifactMetadata {
+                    provenance: LabelProvenance::Observed,
+                    window_from_ns: 0,
+                    window_to_ns: 10,
+                    dataset_id: "dataset".into(),
+                },
+                report,
+            )
+            .unwrap_err(),
+            ArtifactError::Evidence
+        );
     }
 }

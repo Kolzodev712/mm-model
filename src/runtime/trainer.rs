@@ -130,15 +130,12 @@ fn fit_books(
         .filter(|row| matches!(row.outcome(), ObservedOutcome::Filled { .. }))
         .count();
     runtime_info!(examples = rows.len(), fills, "training examples built");
-    let n = rows.len();
-    let train_end = n * (100 - u32::from(policy.holdout_percent)) as usize / 100;
-    if train_end == 0 || train_end >= n {
-        return Ok(TrainOutcome::InsufficientData {
-            reason: "chronological split produced an empty train or holdout slice".into(),
-        });
-    }
-    let train_rows = &rows[..train_end];
-    let holdout_rows = &rows[train_end..];
+    let split = match checked_split(&rows, policy) {
+        Ok(split) => split,
+        Err(outcome) => return Ok(outcome),
+    };
+    let train_rows = split.train;
+    let holdout_rows = split.holdout;
     let provenance = train_rows[0].provenance();
     if rows.iter().any(|row| row.provenance() != provenance) {
         return Ok(TrainOutcome::Rejected {
@@ -155,27 +152,17 @@ fn fit_books(
         .filter(|row| matches!(row.outcome(), ObservedOutcome::Filled { .. }))
         .count();
     let holdout_misses = holdout_rows.len() - holdout_fills;
-    if train_rows.len() < policy.min_train_examples
-        || train_fills < policy.min_train_fills
-        || train_unfilled < policy.min_train_misses
-        || holdout_rows.len() < policy.min_holdout_examples
-        || holdout_fills < policy.min_holdout_fills
-        || holdout_misses < policy.min_holdout_misses
-    {
-        return Ok(TrainOutcome::InsufficientData {
-            reason: "train or holdout does not meet the evidence policy".into(),
-        });
-    }
     let fill_rows =
-        crate::data::training::example::logistic_samples(train_rows, provenance, method)
+        crate::data::training::example::logistic_samples(&train_rows, provenance, method)
             .map_err(|_| TrainFailure::Dataset)?;
-    let pnl_rows = crate::data::training::example::pnl_samples(train_rows, provenance, method)
+    let pnl_rows = crate::data::training::example::pnl_samples(&train_rows, provenance, method)
         .map_err(|_| TrainFailure::Dataset)?;
     let holdout_fill =
-        crate::data::training::example::logistic_samples(holdout_rows, provenance, method)
+        crate::data::training::example::logistic_samples(&holdout_rows, provenance, method)
             .map_err(|_| TrainFailure::Dataset)?;
-    let holdout_pnl = crate::data::training::example::pnl_samples(holdout_rows, provenance, method)
-        .map_err(|_| TrainFailure::Dataset)?;
+    let holdout_pnl =
+        crate::data::training::example::pnl_samples(&holdout_rows, provenance, method)
+            .map_err(|_| TrainFailure::Dataset)?;
     let train = TrainConfig {
         learning_rate: 0.2,
         epochs: 200,
@@ -210,16 +197,22 @@ fn fit_books(
     let base_pnl = pnl_baseline
         .mean_loss(&holdout_pnl)
         .map_err(|_| TrainFailure::Fit)?;
-    let (ev_model_error, ev_baseline_error) = ev_mae(&fill, &pnl, holdout_rows, rate * mean_pnl)?;
+    let (ev_model_error, ev_baseline_error) = ev_mae(&fill, &pnl, &holdout_rows, rate * mean_pnl)?;
     if !learned_fill.is_finite()
         || !learned_pnl.is_finite()
         || !ev_model_error.is_finite()
-        || learned_fill > base_fill
-        || learned_pnl > base_pnl
-        || ev_model_error > ev_baseline_error
+        || !ev_baseline_error.is_finite()
+        || !crate::model::artifact::losses_accept(
+            learned_fill,
+            base_fill,
+            learned_pnl,
+            base_pnl,
+            ev_model_error,
+            ev_baseline_error,
+        )
     {
         return Ok(TrainOutcome::Rejected {
-            reason: "holdout error is worse than the constant training baseline".into(),
+            reason: "holdout did not beat the constant training baselines; combined EV must be strictly better".into(),
         });
     }
     if provenance != LabelProvenance::Observed {
@@ -228,8 +221,11 @@ fn fit_books(
         });
     }
     let report = ValidationReport {
+        rows_before_purge: split.rows_before_purge as u64,
+        purged_training_rows: split.purged as u64,
         train_examples: train_rows.len() as u64,
         holdout_examples: holdout_rows.len() as u64,
+        holdout_start_ns: split.holdout_start_ns,
         train_fills: train_fills as u64,
         train_misses: train_unfilled as u64,
         holdout_fills: holdout_fills as u64,
@@ -296,6 +292,80 @@ fn ev_mae(
     }
     let count = holdout.len() as f64;
     Ok((model / count, baseline / count))
+}
+
+struct PurgedSplit {
+    holdout_start_ns: i64,
+    rows_before_purge: usize,
+    purged: usize,
+    train: Vec<crate::data::training::example::TrainingExample>,
+    holdout: Vec<crate::data::training::example::TrainingExample>,
+}
+
+/// Sort is the caller's job. Holdout is the last `holdout_percent` of rows by decision time.
+/// A training candidate is dropped when its horizon snapshot is at or after the first holdout decision.
+fn checked_split(
+    rows: &[crate::data::training::example::TrainingExample],
+    policy: EvidencePolicy,
+) -> Result<PurgedSplit, TrainOutcome> {
+    let Some(split) = purge_holdout(rows, policy.holdout_percent) else {
+        return Err(TrainOutcome::InsufficientData {
+            reason: "chronological split produced an empty train or holdout slice".into(),
+        });
+    };
+    let train_fills = split
+        .train
+        .iter()
+        .filter(|row| matches!(row.outcome(), ObservedOutcome::Filled { .. }))
+        .count();
+    let train_misses = split.train.len() - train_fills;
+    let holdout_fills = split
+        .holdout
+        .iter()
+        .filter(|row| matches!(row.outcome(), ObservedOutcome::Filled { .. }))
+        .count();
+    let holdout_misses = split.holdout.len() - holdout_fills;
+    if split.train.is_empty()
+        || split.train.len() < policy.min_train_examples
+        || train_fills < policy.min_train_fills
+        || train_misses < policy.min_train_misses
+        || split.holdout.len() < policy.min_holdout_examples
+        || holdout_fills < policy.min_holdout_fills
+        || holdout_misses < policy.min_holdout_misses
+    {
+        return Err(TrainOutcome::InsufficientData {
+            reason: "train or holdout does not meet the evidence policy after purging".into(),
+        });
+    }
+    Ok(split)
+}
+
+fn purge_holdout(
+    rows: &[crate::data::training::example::TrainingExample],
+    holdout_percent: u8,
+) -> Option<PurgedSplit> {
+    let n = rows.len();
+    let train_end = n * (100 - u32::from(holdout_percent)) as usize / 100;
+    if train_end == 0 || train_end >= n {
+        return None;
+    }
+    let holdout_start_ns = rows[train_end].timing().decision_ns;
+    let mut train = Vec::new();
+    let mut purged = 0usize;
+    for row in &rows[..train_end] {
+        if row.timing().horizon_snapshot_ns >= holdout_start_ns {
+            purged += 1;
+        } else {
+            train.push(*row);
+        }
+    }
+    Some(PurgedSplit {
+        holdout_start_ns,
+        rows_before_purge: train_end,
+        purged,
+        train,
+        holdout: rows[train_end..].to_vec(),
+    })
 }
 
 fn val_mean_pnl(rows: &[crate::model::pnl::PnlSample<FEATURE_COUNT>]) -> f64 {
@@ -457,5 +527,149 @@ mod tests {
             train_history(&history, &later, &job).unwrap(),
             TrainOutcome::InsufficientData { .. }
         ));
+    }
+
+    fn labeled_row(
+        decision: i64,
+        horizon_snapshot: i64,
+        filled: bool,
+        pnl: f64,
+    ) -> crate::data::training::example::TrainingExample {
+        use crate::data::training::example::{
+            DecisionTimeInputs, LabelTiming, ObservedOutcome, TrainingExample,
+        };
+        let market = FairValueMethod::Microprice
+            .derive_top(99.9, 1.0, 100.1, 1.0)
+            .unwrap();
+        TrainingExample::new(
+            DecisionTimeInputs::new(market, CandidateQuote::new(99.8, 1.0).unwrap()),
+            if filled {
+                ObservedOutcome::Filled {
+                    pnl,
+                    horizon_fair_value: 100.0,
+                }
+            } else {
+                ObservedOutcome::Unfilled
+            },
+            LabelProvenance::Observed,
+            FairValueMethod::Microprice,
+            LabelTiming {
+                decision_ns: decision,
+                decision_snapshot_ns: decision,
+                requested_horizon_ns: 1_000,
+                horizon_snapshot_ns: horizon_snapshot,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Ten decisions at 0,100,...,900. A 20% holdout starts at decision 800.
+    fn boundary_rows(crossing_pnl: f64) -> Vec<crate::data::training::example::TrainingExample> {
+        (0..10)
+            .map(|index| {
+                let decision = index * 100;
+                let horizon = if index == 7 { 800 } else { decision + 50 };
+                let filled = index == 7 || index % 2 == 0;
+                let pnl = if index == 7 { crossing_pnl } else { 0.25 };
+                labeled_row(decision, horizon, filled, pnl)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_label_that_finishes_before_the_holdout_stays_in_training() {
+        let rows = boundary_rows(1.0);
+        let split = purge_holdout(&rows, 20).unwrap();
+        assert_eq!(split.holdout_start_ns, 800);
+        assert!(split
+            .train
+            .iter()
+            .any(|row| row.timing().decision_ns == 600 && row.timing().horizon_snapshot_ns == 650));
+    }
+
+    #[test]
+    fn a_label_that_reaches_the_holdout_is_purged_and_not_moved() {
+        let rows = boundary_rows(9.0);
+        let split = purge_holdout(&rows, 20).unwrap();
+        assert_eq!(split.purged, 1);
+        assert_eq!(split.rows_before_purge, 8);
+        assert_eq!(split.train.len(), 7);
+        assert!(split
+            .train
+            .iter()
+            .all(|row| row.timing().decision_ns != 700));
+        assert!(split
+            .holdout
+            .iter()
+            .all(|row| row.timing().decision_ns >= 800));
+        assert_eq!(split.holdout.len(), 2);
+    }
+
+    #[test]
+    fn purging_below_the_evidence_policy_is_insufficient_data() {
+        let mut rows = boundary_rows(1.0);
+        for row in rows.iter_mut().take(8) {
+            if row.timing().decision_ns != 0 {
+                *row = labeled_row(row.timing().decision_ns, 800, false, 0.0);
+            }
+        }
+        let policy = EvidencePolicy {
+            min_train_examples: 3,
+            min_train_fills: 1,
+            min_train_misses: 1,
+            min_holdout_examples: 2,
+            min_holdout_fills: 1,
+            min_holdout_misses: 1,
+            ..EvidencePolicy::default()
+        };
+        let before = purge_holdout(&rows, policy.holdout_percent).unwrap();
+        assert!(before.rows_before_purge >= policy.min_train_examples);
+        assert!(before.train.len() < policy.min_train_examples);
+        assert!(matches!(
+            checked_split(&rows, policy),
+            Err(TrainOutcome::InsufficientData { .. })
+        ));
+    }
+
+    #[test]
+    fn changing_a_purged_rows_holdout_label_does_not_change_the_fitted_slice() {
+        let low = boundary_rows(0.1);
+        let high = boundary_rows(50.0);
+        let low_split = purge_holdout(&low, 20).unwrap();
+        let high_split = purge_holdout(&high, 20).unwrap();
+        assert_eq!(low_split.train, high_split.train);
+        assert!(low_split
+            .train
+            .iter()
+            .all(|row| row.timing().horizon_snapshot_ns < low_split.holdout_start_ns));
+        let fitted_pnls: Vec<f64> = low_split
+            .train
+            .iter()
+            .filter_map(|row| match row.outcome() {
+                crate::data::training::example::ObservedOutcome::Filled { pnl, .. } => Some(pnl),
+                crate::data::training::example::ObservedOutcome::Unfilled => None,
+            })
+            .collect();
+        assert!(!fitted_pnls.contains(&50.0));
+        assert!(!fitted_pnls.contains(&0.1));
+    }
+
+    #[test]
+    fn holdout_labels_do_not_enter_the_training_baseline_slice() {
+        let mut rows = boundary_rows(1.0);
+        rows[8] = labeled_row(800, 850, true, 40.0);
+        rows[9] = labeled_row(900, 950, false, 0.0);
+        let split = purge_holdout(&rows, 20).unwrap();
+        let fills: Vec<f64> = split
+            .train
+            .iter()
+            .filter_map(|row| match row.outcome() {
+                crate::data::training::example::ObservedOutcome::Filled { pnl, .. } => Some(pnl),
+                crate::data::training::example::ObservedOutcome::Unfilled => None,
+            })
+            .collect();
+        assert!(!fills.contains(&40.0));
+        let mean = fills.iter().sum::<f64>() / fills.len() as f64;
+        assert!((mean - 0.25).abs() < 1e-12);
     }
 }

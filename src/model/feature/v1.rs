@@ -9,9 +9,10 @@
 //! [`TOP_QUANTITY_IMBALANCE`]. Both are kept so that overlap can be measured
 //! later rather than removed by assumption.
 //!
-//! Schema version 1 has five relative features. The conditional-P&L label is
-//! total P&L, which scales with size, so candidate quantity is included as a
-//! fraction of displayed top-of-book size.
+//! Schema version 2 has five features. The three price distances are stored in
+//! basis points. The conditional-P&L label is total P&L, which scales with
+//! size, so candidate quantity is included as a fraction of displayed
+//! top-of-book size.
 //!
 //! Inference writes one stack array. It does not allocate.
 
@@ -33,13 +34,13 @@ pub const PRICE_RATIO_SCALE: f64 = 10_000.0;
 /// Number of features in [`FEATURE_SCHEMA_VERSION`].
 pub const FEATURE_COUNT: usize = 5;
 
-/// `(fair_value - quote_price) / fair_value`. Dimensionless.
+/// `(fair_value - quote_price) / fair_value`, then scaled to basis points.
 ///
 /// Positive when a buy is bid below the book-derived reference price.
 /// Source: decision-time reference price and candidate price.
 pub const QUOTE_DISTANCE_FROM_FAIR: usize = 0;
 
-/// `(best_ask_price - best_bid_price) / fair_value`. Dimensionless.
+/// `(best_ask_price - best_bid_price) / fair_value`, then scaled to basis points.
 ///
 /// The exchange spread scaled by the reference price.
 /// Source: decision-time best bid, best ask, and the reference price.

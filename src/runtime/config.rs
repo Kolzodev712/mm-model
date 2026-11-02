@@ -68,7 +68,9 @@ pub enum TrainingTrigger {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvidencePolicy {
-    /// Percent of the latest rows held out. The earlier rows are the only training data.
+    /// Percent of the latest decision rows held out.
+    /// Earlier rows are training candidates. A candidate whose horizon snapshot
+    /// reaches the first holdout decision is removed from fitting.
     pub holdout_percent: u8,
     pub min_train_examples: usize,
     pub min_train_fills: usize,
