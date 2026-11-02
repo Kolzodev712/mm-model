@@ -137,6 +137,7 @@ pub fn run_live<C: crate::runtime::clock::Clock>(
     quote_model: Option<&LogisticRegression<FEATURE_COUNT>>,
     market_model: Option<&LogisticRegression<MARKET_FEATURE_COUNT>>,
     market_definition: Option<MarketOutcomeDefinition>,
+    quote_horizon_ns: Option<i64>,
     should_stop: &impl Fn() -> bool,
 ) -> Result<crate::runtime::stats::RunStats, InferenceRunError> {
     use crate::data::market::source::BookSource;
@@ -182,7 +183,7 @@ pub fn run_live<C: crate::runtime::clock::Clock>(
                 ) {
                     Ok(result) => {
                         let latency_ns = tick.elapsed().as_nanos();
-                        log_book(&result, &probabilities);
+                        log_book(&result, &probabilities, quote_horizon_ns);
                         stats.record_book(crate::runtime::stats::BookOutcome {
                             probe_count: result.probe_count,
                             market_probability: result
@@ -210,15 +211,20 @@ pub fn run_live<C: crate::runtime::clock::Clock>(
 }
 
 #[cfg(all(feature = "live", feature = "parquet-storage"))]
-fn log_book(result: &BookProbabilities, probabilities: &[ProbeProbability]) {
+fn log_book(
+    result: &BookProbabilities,
+    probabilities: &[ProbeProbability],
+    quote_horizon_ns: Option<i64>,
+) {
     #[cfg(feature = "observe")]
     {
         let market = result.market.map(|prediction| prediction.probability.get());
+        let quote_fill_horizon_ms = quote_horizon_ns.map(|ns| ns / 1_000_000);
         let probes: Vec<String> = probabilities[..result.probe_count]
             .iter()
             .map(|probe| {
                 format!(
-                    "{:.4}bp={:.4}",
+                    "probe_distance_bps={:.4} fill_probability={:.4}",
                     probe.offset_bps,
                     probe.fill_probability.get()
                 )
@@ -229,9 +235,14 @@ fn log_book(result: &BookProbabilities, probabilities: &[ProbeProbability]) {
             bid = result.best_bid,
             ask = result.best_ask,
             market_probability = ?market,
+            quote_fill_horizon_ms = ?quote_fill_horizon_ms,
             probes = ?probes,
             "live inference probabilities"
         );
+    }
+    #[cfg(not(feature = "observe"))]
+    {
+        let _ = (result, probabilities, quote_horizon_ns);
     }
 }
 

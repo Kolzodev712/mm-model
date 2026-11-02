@@ -91,7 +91,7 @@ impl LabelTiming {
 /// What happened after a quote was actually submitted or explicitly simulated.
 ///
 /// A filled label's reference price is the horizon estimate. It is not a
-/// decision-time feature and it is not supplied on [`FillFacts`].
+/// decision-time feature. It is not part of [`QuoteOutcome`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ObservedOutcome {
     /// The quote did not fill. There is no fill P&L.
@@ -176,21 +176,21 @@ impl TrainingExample {
     }
 }
 
-/// Execution facts for a submitted or simulated buy.
+/// Lifecycle of one submitted or explicitly simulated quote.
 ///
-/// There is no horizon reference price here. The dataset builder derives that
-/// from a later book snapshot with the configured estimator.
+/// A fill time, or the time through which a miss was observed, is required
+/// before a horizon label can be derived. This type does not contain a future
+/// reference price.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum FillFacts {
-    /// The quote did not fill.
-    Unfilled,
-    /// The quote filled in full at `execution_price`.
+pub enum QuoteOutcome {
+    /// The quote filled in full. `fill_ns` is when that fact became known.
     Filled {
-        /// Price of the fill.
+        fill_ns: i64,
         execution_price: f64,
-        /// Non-negative fee charged on the fill.
         fees: f64,
     },
+    /// The quote had not filled through `observed_until_ns`.
+    Unfilled { observed_until_ns: i64 },
 }
 
 /// Turns examples of one provenance into logistic-regression samples.

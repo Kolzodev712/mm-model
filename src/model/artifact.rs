@@ -18,7 +18,7 @@ use crate::model::feature::v1::{FEATURE_COUNT, FEATURE_SCHEMA_VERSION};
 use crate::model::fill::LogisticRegression;
 use crate::model::prediction::InvalidWeights;
 
-pub const ARTIFACT_VERSION: u32 = 4;
+pub const ARTIFACT_VERSION: u32 = 5;
 
 /// Which predictive problem a file answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,6 +447,14 @@ mod tests {
         assert_eq!(
             ModelArtifact::read_json(&path).unwrap_err(),
             ArtifactError::Json
+        );
+        let artifact = quote_artifact(LabelSource::ObservedQuote, passing_report()).unwrap();
+        let mut value = serde_json::to_value(&artifact).unwrap();
+        value["version"] = serde_json::json!(4);
+        std::fs::write(&path, value.to_string()).unwrap();
+        assert_eq!(
+            ModelArtifact::read_json(&path).unwrap_err(),
+            ArtifactError::Version
         );
         let _ = std::fs::remove_file(&path);
     }

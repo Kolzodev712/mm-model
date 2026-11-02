@@ -72,6 +72,7 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
                 loaded.quote.as_ref(),
                 loaded.market.as_ref(),
                 loaded.definition,
+                loaded.quote_horizon_ns,
                 &should_stop,
             )?;
             tracing::info!(
@@ -92,6 +93,7 @@ struct LoadedModels {
     quote: Option<LogisticRegression<FEATURE_COUNT>>,
     market: Option<LogisticRegression<MARKET_FEATURE_COUNT>>,
     definition: Option<MarketOutcomeDefinition>,
+    quote_horizon_ns: Option<i64>,
 }
 
 fn load_live_models(config: &AppConfig) -> Result<LoadedModels, Box<dyn std::error::Error>> {
@@ -102,6 +104,7 @@ fn load_live_models(config: &AppConfig) -> Result<LoadedModels, Box<dyn std::err
         quote: None,
         market: None,
         definition: None,
+        quote_horizon_ns: None,
     };
     for model in &task.models {
         let artifact = ModelArtifact::read_json(&model.artifact_path)?;
@@ -119,6 +122,7 @@ fn load_live_models(config: &AppConfig) -> Result<LoadedModels, Box<dyn std::err
                     artifact.training_horizon_ns,
                     None,
                 )?;
+                loaded.quote_horizon_ns = Some(artifact.training_horizon_ns);
                 loaded.quote = Some(artifact.quote_model()?);
             }
             ModelFamily::MarketUpMove => {

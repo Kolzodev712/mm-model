@@ -6,8 +6,8 @@
 
 use std::path::Path;
 
-use crate::data::training::dataset::{build_training_examples, DatasetConfig, QuoteEvent};
-use crate::data::training::example::{LabelProvenance, ObservedOutcome};
+use crate::data::training::dataset::{build_quote_fill_examples, DatasetConfig, QuoteEvent};
+use crate::data::training::example::LabelProvenance;
 use crate::data::training::history::{BookRange, HistoricalBooks};
 use crate::data::training::market::{build_market_examples, MarketDatasetConfig, MarketExample};
 use crate::data::training::quotes::{QuoteHistory, QuoteRange};
@@ -134,7 +134,7 @@ fn fit_quote(
         });
     }
     let config = DatasetConfig::new(job.method, horizon_ns).map_err(|_| TrainFailure::Dataset)?;
-    let set = match build_training_examples(books, quotes, config) {
+    let set = match build_quote_fill_examples(books, quotes, config) {
         Ok(set) => set,
         Err(err) => {
             return Ok(TrainOutcome::Rejected {
@@ -142,37 +142,51 @@ fn fit_quote(
             })
         }
     };
-    let mut rows = set.examples().to_vec();
-    rows.sort_by_key(|row| row.timing().decision_ns);
-    let decisions: Vec<i64> = rows.iter().map(|row| row.timing().decision_ns).collect();
-    let horizons: Vec<i64> = rows
-        .iter()
-        .map(|row| row.timing().horizon_snapshot_ns)
-        .collect();
-    let split = match checked_split(&decisions, &horizons, job.evidence, |index| {
-        matches!(rows[index].outcome(), ObservedOutcome::Filled { .. })
+    runtime_info!(
+        input_rows = set.input_rows,
+        positive_rows = set.positive_rows,
+        negative_rows = set.negative_rows,
+        censored_rows = set.censored_rows,
+        "quote-fill label summary"
+    );
+    if set.examples.is_empty() {
+        return Ok(TrainOutcome::InsufficientData {
+            reason: "no usable fill-within-horizon rows; censored observations were excluded"
+                .into(),
+        });
+    }
+    let mut rows = set.examples;
+    rows.sort_by_key(|row| row.decision_ns);
+    let decisions: Vec<i64> = rows.iter().map(|row| row.decision_ns).collect();
+    let resolved: Vec<i64> = rows.iter().map(|row| row.label_resolved_ns).collect();
+    let split = match checked_split(&decisions, &resolved, job.evidence, |index| {
+        rows[index].filled_within_horizon
     }) {
         Ok(split) => split,
         Err(outcome) => return Ok(outcome),
     };
-    let provenance = rows[split.train_index[0]].provenance();
-    if rows.iter().any(|row| row.provenance() != provenance) {
+    let provenance = rows[split.train_index[0]].provenance;
+    if rows.iter().any(|row| row.provenance != provenance) {
         return Ok(TrainOutcome::Rejected {
             reason: "mixed label provenance".into(),
         });
     }
-    let train_rows: Vec<_> = split.train_index.iter().map(|index| rows[*index]).collect();
-    let holdout_rows: Vec<_> = split
+    let train: Vec<_> = split
+        .train_index
+        .iter()
+        .map(|index| FillSample {
+            features: rows[*index].features,
+            positive: rows[*index].filled_within_horizon,
+        })
+        .collect();
+    let holdout: Vec<_> = split
         .holdout_index
         .iter()
-        .map(|index| rows[*index])
+        .map(|index| FillSample {
+            features: rows[*index].features,
+            positive: rows[*index].filled_within_horizon,
+        })
         .collect();
-    let train =
-        crate::data::training::example::logistic_samples(&train_rows, provenance, job.method)
-            .map_err(|_| TrainFailure::Dataset)?;
-    let holdout =
-        crate::data::training::example::logistic_samples(&holdout_rows, provenance, job.method)
-            .map_err(|_| TrainFailure::Dataset)?;
     let label_source = match provenance {
         LabelProvenance::Observed => LabelSource::ObservedQuote,
         LabelProvenance::Simulated => LabelSource::SimulatedQuote,
@@ -186,7 +200,7 @@ fn fit_quote(
         split: &split,
         train: &train,
         holdout: &holdout,
-        raw_rows: rows.len(),
+        raw_rows: set.input_rows,
     })
 }
 
@@ -490,7 +504,7 @@ mod tests {
     use super::*;
     use crate::data::training::dataset::QuoteEvent;
     use crate::data::training::example::{
-        DecisionTimeInputs, FillFacts, LabelProvenance, LabelTiming, ObservedOutcome,
+        DecisionTimeInputs, LabelProvenance, LabelTiming, ObservedOutcome, QuoteOutcome,
         TrainingExample,
     };
     use crate::data::training::history::MemoryBooks;
@@ -548,15 +562,17 @@ mod tests {
             symbol: "BTCUSDT",
             books: &books,
         };
-        let quote = QuoteEvent::new(
+        let quote = QuoteEvent::try_new(
             1_000,
             QuoteContext::new(99.8, 1.0).unwrap(),
             LabelProvenance::Simulated,
-            FillFacts::Filled {
+            QuoteOutcome::Filled {
+                fill_ns: 1_200,
                 execution_price: 99.8,
                 fees: 0.0,
             },
-        );
+        )
+        .unwrap();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -622,12 +638,15 @@ mod tests {
             train_history(&history, &empty, &job).unwrap(),
             TrainOutcome::SkippedNoLabels
         ));
-        let quote = QuoteEvent::new(
+        let quote = QuoteEvent::try_new(
             1_000,
             QuoteContext::new(99.8, 1.0).unwrap(),
             LabelProvenance::Observed,
-            FillFacts::Unfilled,
-        );
+            QuoteOutcome::Unfilled {
+                observed_until_ns: 2_000,
+            },
+        )
+        .unwrap();
         let later = crate::data::training::quotes::MemoryQuoteHistory {
             exchange: "binance",
             symbol: "BTCUSDT",
@@ -784,5 +803,17 @@ mod tests {
         assert!(low_split.train_index.iter().all(|index| {
             low[*index].timing().horizon_snapshot_ns < low_split.holdout_start_ns
         }));
+    }
+
+    #[test]
+    fn an_early_fill_stays_trainable_when_only_its_horizon_crosses_the_holdout() {
+        let decisions = [0, 8_000, 9_000, 10_000, 10_500];
+        let resolved = [100, 10_500, 10_500, 10_200, 11_000];
+        let split = chronological_split(&decisions, &resolved, 20).unwrap();
+        assert_eq!(split.holdout_start_ns, 10_500);
+        assert!(split.train_index.contains(&3));
+        assert!(!split.train_index.contains(&1));
+        assert!(!split.train_index.contains(&2));
+        assert_eq!(split.holdout_index, vec![4]);
     }
 }

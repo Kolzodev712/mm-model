@@ -45,15 +45,23 @@ There is no action after the probability.
 ### Model A — quote-conditioned fill probability
 
 ```text
-P(fill within H | market state, quote context)
+P(fill within H | market state at decision time, quote context)
 ```
 
 `QuoteContext` is a price and a quantity. It describes the quote whose outcome is being estimated. It is not an order.
 
+For a decision at `t`, the deadline is `t + H`.
+
+- `fill_ns <= t + H` is a positive label. A fill exactly at the deadline is positive. The label is resolved at `fill_ns`.
+- No fill through `t + H` is a negative label. That includes a fill that happens later, and an unfilled quote observed until the deadline or beyond. The label is resolved at `t + H`, not at a later fill time.
+- An unfilled observation that ends before `t + H` is censored. It is excluded. It is not a negative.
+
+Model A does not use future fair value or P&L to construct its fill label. It needs the decision-time book, the quote context, and the quote lifecycle. A book at `t + H` is not required.
+
 Labels come from outside the public book:
 
-- an export of quotes that were actually submitted, `LabelSource::ObservedQuote`;
-- an explicitly simulated outcome, `LabelSource::SimulatedQuote`.
+- an export of quotes that were actually submitted, with a fill time or an observed-until time, recorded as `LabelSource::ObservedQuote`;
+- an explicitly simulated lifecycle, recorded as `LabelSource::SimulatedQuote`.
 
 Public Binance books do not create fill labels. For the default symbol the quote file is:
 
@@ -61,7 +69,7 @@ Public Binance books do not create fill labels. For the default symbol the quote
 <data-root>/quotes/binance/BTCUSDT.parquet
 ```
 
-`Collect` does not write that file.
+Quote Parquet schema version is 2. A filled row stores `fill_ns`, `execution_price`, and `fees`. An unfilled row stores `observed_until_ns` and does not store those fill fields. Schema version 1 is rejected because it has no lifecycle timestamps. `Collect` does not write this file.
 
 ### Model B — market-outcome probability
 
@@ -131,7 +139,7 @@ flowchart TD
 
 - MMBK is the raw source of truth for the book. A torn tail is ignored on read and truncated before the next append.
 - Book Parquet is a rebuildable copy of a closed UTC hour. Paths come from the partition id, not from the manifest.
-- Quote Parquet is supervised fill history. It is not produced from the public book.
+- Quote Parquet schema version 2 is supervised fill history, including fill time or observed-until time. It is not produced from the public book. Schema version 1 is rejected.
 - A model artifact is derived output. It can be deleted and rebuilt.
 
 ## Storage
@@ -184,14 +192,9 @@ Rows are sorted by decision time. With `n` rows and holdout percent `h`, the tra
 holdout_start_ns = decision time of the first holdout row
 ```
 
-A training candidate is kept only when:
+A training candidate is kept only when its decision is before the holdout and its label-resolution time is also before the holdout. For Model A that time is `label_resolved_ns`: the fill time when the fill is inside `H`, otherwise `t + H`. An early fill can stay in training even when `t + H` falls inside the holdout. For Model B the resolution time is the future book snapshot. A candidate whose label reaches the holdout is removed from fitting. It is not moved into the holdout. If purging leaves too little evidence, the result is `TrainOutcome::InsufficientData`.
 
-```text
-decision_ns < holdout_start_ns
-horizon_snapshot_ns < holdout_start_ns
-```
-
-A candidate whose label snapshot reaches the holdout is removed from fitting. It is not moved into the holdout. If purging leaves too little evidence, the result is `TrainOutcome::InsufficientData`.
+The quote-fill build also reports how many input rows were usable positives, usable negatives, or censored because observation ended before `t + H`.
 
 ```mermaid
 flowchart LR
@@ -260,7 +263,7 @@ Both reject an empty book, a non-finite or non-positive price or quantity, and a
 
 ## Artifacts
 
-JSON artifact version is 4. A file records the model family, target horizon, threshold for an up move, feature schema, fair-value method, label source, training window, dataset id, weights, and the validation report. Version 3 files are rejected.
+JSON artifact version is 5. A file records the model family, target horizon, threshold for an up move, feature schema, fair-value method, label source, training window, dataset id, weights, and the validation report. Older artifacts are rejected. A quote-fill artifact's `training_horizon_ns` is the `H` used to decide whether a fill was inside the horizon. Live probabilities for that artifact are probabilities of a fill within that horizon.
 
 Live inference reads those files. It does not embed a second copy of the target in the config. The artifact's family, horizon, and threshold are what get checked against the run's fair-value method.
 
@@ -321,7 +324,7 @@ This fits `P(reference price rises by at least 1 bp within 1 s)` from book histo
 just run-config configs/train-quote-fill-1s.json
 ```
 
-This fits `P(fill within 1 s | market state, quote context)`. It reads `./data/quotes/binance/BTCUSDT.parquet`. That file is an export of quotes that were actually submitted, or an explicitly simulated outcome file in the quote schema. `Collect` does not create it.
+This fits `P(fill within 1 s | market state, quote context)`. It reads `./data/quotes/binance/BTCUSDT.parquet`. Each row needs a decision time, quote price, and quantity, plus either a fill time with execution price and fees, or an observed-until time for a quote that had not filled. An observation that ends before the one-second deadline is censored and left out of the fit. The file is an export from a system that submitted the quotes, or an explicitly simulated lifecycle. `Collect` does not create it.
 
 ### Live inference
 
