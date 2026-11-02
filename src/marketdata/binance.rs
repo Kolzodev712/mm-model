@@ -24,8 +24,82 @@ use super::book::{Level, ParsedDepth, BOOK_DEPTH};
 pub const BINANCE_EXCHANGE: &str = "binance";
 /// Instrument recorded by the reference recorder.
 pub const BTCUSDT: &str = "BTCUSDT";
-/// Public unauthenticated partial-depth stream, top 10, 100 ms.
+/// Example public endpoint. Not a model assumption.
+pub const BINANCE_SPOT_WS: &str = "wss://stream.binance.com:9443";
+
+/// Example stream kept for documentation. Clients build their own URL.
 pub const PARTIAL_DEPTH_URL: &str = "wss://stream.binance.com:9443/ws/btcusdt@depth10@100ms";
+
+/// Connection settings for one partial-depth stream.
+///
+/// The URL is derived once from these fields. Symbol is not hardcoded inside
+/// the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceBookConfig {
+    base_endpoint: String,
+    symbol: String,
+    depth: u16,
+    update_ms: u64,
+}
+
+impl BinanceBookConfig {
+    /// Spot partial book. Depth must be 5, 10, or 20. Update interval must be 100 or 1000 ms.
+    pub fn new(
+        base_endpoint: impl Into<String>,
+        symbol: impl Into<String>,
+        depth: u16,
+        update_ms: u64,
+    ) -> Result<Self, ParseError> {
+        let base_endpoint = base_endpoint.into();
+        let symbol = symbol.into();
+        if base_endpoint.is_empty()
+            || !(base_endpoint.starts_with("wss://") || base_endpoint.starts_with("ws://"))
+        {
+            return Err(ParseError::Malformed);
+        }
+        if symbol.is_empty() || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(ParseError::Malformed);
+        }
+        if !matches!(depth, 5 | 10 | 20) || !matches!(update_ms, 100 | 1000) {
+            return Err(ParseError::Malformed);
+        }
+        Ok(Self {
+            base_endpoint: base_endpoint.trim_end_matches('/').to_string(),
+            symbol,
+            depth,
+            update_ms,
+        })
+    }
+
+    /// Default BTCUSDT top-10 100 ms example. Callers can choose another symbol.
+    pub fn btcusdt_example() -> Self {
+        Self::new(BINANCE_SPOT_WS, BTCUSDT, 10, 100).expect("example config is valid")
+    }
+
+    #[must_use]
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    #[must_use]
+    pub fn depth(&self) -> u16 {
+        self.depth
+    }
+
+    /// Stream URL. Allocates. Call this at startup, not per book update.
+    #[must_use]
+    pub fn stream_url(&self) -> String {
+        let symbol = self.symbol.to_ascii_lowercase();
+        if self.update_ms == 1000 {
+            format!("{}/ws/{symbol}@depth{}", self.base_endpoint, self.depth)
+        } else {
+            format!(
+                "{}/ws/{symbol}@depth{}@{}ms",
+                self.base_endpoint, self.depth, self.update_ms
+            )
+        }
+    }
+}
 
 /// The payload was not a usable partial-depth snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,5 +520,17 @@ mod tests {
             Err(ParseError::Unordered)
         );
         assert_eq!(depth.bid_count, 0);
+    }
+
+    #[test]
+    fn config_builds_the_partial_depth_url_once() {
+        let config = BinanceBookConfig::new(BINANCE_SPOT_WS, "BTCUSDT", 10, 100).unwrap();
+        assert_eq!(config.stream_url(), PARTIAL_DEPTH_URL);
+        let slow = BinanceBookConfig::new(BINANCE_SPOT_WS, "ethusdt", 5, 1000).unwrap();
+        assert_eq!(
+            slow.stream_url(),
+            "wss://stream.binance.com:9443/ws/ethusdt@depth5"
+        );
+        assert!(BinanceBookConfig::new(BINANCE_SPOT_WS, "BTCUSDT", 7, 100).is_err());
     }
 }

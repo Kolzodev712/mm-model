@@ -34,9 +34,15 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(feature = "artifact")]
+pub mod artifact;
+pub mod candidates;
+pub mod clock;
 pub mod dataset;
 pub mod decision;
+pub mod demo;
 pub mod domain;
+pub mod evaluate;
 pub mod evaluation;
 pub mod fair_value;
 pub mod features;
@@ -44,8 +50,12 @@ pub mod linear;
 pub mod logistic;
 pub mod marketdata;
 pub mod model;
+pub mod reconnect;
 pub mod selection;
+pub mod source;
+pub mod stats;
 pub mod trainset;
+pub mod units;
 
 pub use dataset::{build_training_examples, BuildError, DatasetConfig, QuoteEvent, TrainingSet};
 pub use decision::{CandidateQuote, MarketInputError, MarketState};
@@ -55,18 +65,24 @@ pub use domain::{
 };
 pub use evaluation::{evaluate_strategies, StrategyEvaluation};
 pub use fair_value::{FairValueError, FairValueMethod};
-pub use features::{extract_features, FeatureVector, FEATURE_COUNT, FEATURE_NAMES};
+pub use features::{
+    extract_features, FeatureVector, FEATURE_COUNT, FEATURE_NAMES, FEATURE_SCHEMA_V1,
+};
 pub use linear::{LinearRegression, PnlSample};
 pub use logistic::{sigmoid, FillSample, LogisticRegression};
 pub use model::{
     predict_quote, score_candidates, ConditionalPnlModel, FillProbabilityModel, PredictError,
     QuotePrediction, TrainConfig, TrainError,
 };
-pub use selection::{select_action, select_quote, ActionScore, QuoteDecision};
+pub use selection::{
+    select_action, select_learned, select_quote, ActionScore, LearnedChoice, QuoteDecision,
+    ScoredCandidate,
+};
 pub use trainset::{
     logistic_samples, pnl_samples, DecisionTimeInputs, ExampleError, FillFacts, LabelProvenance,
     LabelTiming, ObservedOutcome, TrainingExample,
 };
+pub use units::{CandidateId, DurationNanos, Fee, Pnl, Price, Probability, Quantity, UnixNanos};
 
 #[cfg(test)]
 pub(crate) mod test_fixture;

@@ -9,10 +9,9 @@
 //! [`TOP_QUANTITY_IMBALANCE`]. Both are kept so that overlap can be measured
 //! later rather than removed by assumption.
 //!
-//! The first set is four relative quantities. Candidate size is not a feature:
-//! a conditional-P&L label is the total mark-to-reference P&L of that fill, so
-//! a model fit on mixed sizes does not see size explicitly. That is a
-//! limitation of this feature set, not a hidden scaling inside expected value.
+//! Schema version 1 has five relative features. The conditional-P&L label is
+//! total P&L, which scales with size, so candidate quantity is included as a
+//! fraction of displayed top-of-book size.
 //!
 //! Inference writes one stack array. It does not allocate.
 
@@ -20,8 +19,11 @@ use std::fmt;
 
 use crate::decision::{CandidateQuote, MarketState};
 
-/// Number of features in the first learned baseline.
-pub const FEATURE_COUNT: usize = 4;
+/// Schema version stored in model artifacts. Version 1 is the five-feature row.
+pub const FEATURE_SCHEMA_V1: u32 = 1;
+
+/// Number of features in [`FEATURE_SCHEMA_V1`].
+pub const FEATURE_COUNT: usize = 5;
 
 /// `(fair_value - quote_price) / fair_value`. Dimensionless.
 ///
@@ -52,12 +54,20 @@ pub const QUOTE_DISTANCE_FROM_BEST_BID: usize = 2;
 /// quantities. Microprice uses those same quantities.
 pub const TOP_QUANTITY_IMBALANCE: usize = 3;
 
+/// `candidate_quantity / (best_bid_quantity + best_ask_quantity)`. Dimensionless.
+///
+/// Decision-time only. Present because the conditional-P&L label is total P&L,
+/// which changes with size. The denominator is the same displayed size used by
+/// microprice and imbalance, so this feature is correlated with both.
+pub const RELATIVE_CANDIDATE_QUANTITY: usize = 4;
+
 /// Stable names for logs and dataset columns. Not read during inference.
 pub const FEATURE_NAMES: [&str; FEATURE_COUNT] = [
     "quote_distance_from_fair",
     "exchange_spread",
     "quote_distance_from_best_bid",
     "top_quantity_imbalance",
+    "relative_candidate_quantity",
 ];
 
 /// Stack-allocated feature row of length `N`.
@@ -96,32 +106,26 @@ impl<const N: usize> FeatureVector<N> {
 ///
 /// No heap allocation. The reference price was estimated once on the market
 /// state and is only read here.
-#[must_use]
 pub fn extract_features(
     market: &MarketState,
     quote: &CandidateQuote,
-) -> FeatureVector<FEATURE_COUNT> {
+) -> Result<FeatureVector<FEATURE_COUNT>, FeatureError> {
     let fair = market.fair_value();
-    debug_assert!(fair > 0.0 && fair.is_finite());
-
     let bid_qty = market.best_bid_quantity();
     let ask_qty = market.best_ask_quantity();
     let depth = bid_qty + ask_qty;
-    let imbalance = if depth > 0.0 {
-        (bid_qty - ask_qty) / depth
-    } else {
-        0.0
-    };
-
-    // Inputs are finite and fair is positive, so these quotients are finite.
-    FeatureVector {
-        values: [
-            (fair - quote.price()) / fair,
-            (market.best_ask_price() - market.best_bid_price()) / fair,
-            (quote.price() - market.best_bid_price()) / fair,
-            imbalance,
-        ],
+    if !(fair.is_finite() && fair > 0.0 && depth.is_finite() && depth > 0.0) {
+        return Err(FeatureError::NonPositiveDepth);
     }
+    let imbalance = (bid_qty - ask_qty) / depth;
+    let relative_quantity = quote.quantity() / depth;
+    FeatureVector::new([
+        (fair - quote.price()) / fair,
+        (market.best_ask_price() - market.best_bid_price()) / fair,
+        (quote.price() - market.best_bid_price()) / fair,
+        imbalance,
+        relative_quantity,
+    ])
 }
 
 /// A feature row contained a non-finite value.
@@ -129,11 +133,17 @@ pub fn extract_features(
 pub enum FeatureError {
     /// At least one coordinate was NaN or infinite.
     NonFinite,
+    /// Top-of-book size was not a positive finite number.
+    NonPositiveDepth,
 }
 
 impl fmt::Display for FeatureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("feature values must be finite")
+        let message = match self {
+            Self::NonFinite => "feature values must be finite",
+            Self::NonPositiveDepth => "top-of-book quantity must be positive to scale features",
+        };
+        f.write_str(message)
     }
 }
 
@@ -155,7 +165,7 @@ mod tests {
         let state = market(2.0, 1.0);
         let quote = CandidateQuote::new(99.8, 1.0).unwrap();
         let fair = state.fair_value();
-        let features = extract_features(&state, &quote);
+        let features = extract_features(&state, &quote).unwrap();
         let values = features.as_array();
         assert_eq!(values.len(), FEATURE_COUNT);
         assert_eq!(FEATURE_NAMES.len(), FEATURE_COUNT);
@@ -163,6 +173,8 @@ mod tests {
         assert!((values[EXCHANGE_SPREAD] - ((100.1 - 99.9) / fair)).abs() < 1e-12);
         assert!((values[QUOTE_DISTANCE_FROM_BEST_BID] - ((99.8 - 99.9) / fair)).abs() < 1e-12);
         assert!((values[TOP_QUANTITY_IMBALANCE] - (1.0 / 3.0)).abs() < 1e-12);
+        assert!((values[RELATIVE_CANDIDATE_QUANTITY] - (1.0 / 3.0)).abs() < 1e-12);
+        assert_eq!(FEATURE_SCHEMA_V1, 1);
         assert!(values.iter().all(|value| value.is_finite()));
     }
 

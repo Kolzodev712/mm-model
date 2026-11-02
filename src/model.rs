@@ -13,29 +13,33 @@
 use std::fmt;
 
 use crate::decision::{CandidateQuote, MarketState};
-use crate::features::{extract_features, FeatureVector, FEATURE_COUNT};
+use crate::features::{extract_features, FeatureError, FeatureVector, FEATURE_COUNT};
+use crate::units::{Pnl, Probability};
 
-/// Predicts `P(fill | features)` in `[0, 1]`.
+/// Predicts `P(fill | features)` in `[0, 1]`, or an error if the arithmetic is invalid.
 pub trait FillProbabilityModel<const N: usize> {
     /// Fill probability for one decision-time feature row.
-    fn predict_fill_probability(&self, features: &FeatureVector<N>) -> f64;
+    fn predict_fill_probability(
+        &self,
+        features: &FeatureVector<N>,
+    ) -> Result<Probability, PredictError>;
 }
 
 /// Predicts `E[P&L | fill, features]`.
 ///
-/// Implementations are trained on filled outcomes only.
+/// Implementations are trained on filled outcomes only. Non-finite output is an error.
 pub trait ConditionalPnlModel<const N: usize> {
-    /// Conditional mark-to-fair P&L for one decision-time feature row.
-    fn predict_pnl_if_filled(&self, features: &FeatureVector<N>) -> f64;
+    /// Conditional mark-to-reference P&L for one decision-time feature row.
+    fn predict_pnl_if_filled(&self, features: &FeatureVector<N>) -> Result<Pnl, PredictError>;
 }
 
 /// Learned estimates for one candidate buy, plus the deterministic expected value.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QuotePrediction {
-    /// Fill probability after clamping into `[0, 1]`.
-    pub fill_probability: f64,
+    /// Validated fill probability. Not a clamped substitute for NaN.
+    pub fill_probability: Probability,
     /// Model output for P&L given a fill. This is not multiplied by probability.
-    pub expected_pnl_if_filled: f64,
+    pub expected_pnl_if_filled: Pnl,
     /// `fill_probability * expected_pnl_if_filled`.
     pub expected_value: f64,
 }
@@ -56,6 +60,8 @@ pub enum TrainError {
     EmptyDataset,
     /// Learning rate was non-positive or not finite.
     InvalidLearningRate,
+    /// A training prediction was not finite.
+    NonFinitePrediction,
 }
 
 impl fmt::Display for TrainError {
@@ -63,6 +69,7 @@ impl fmt::Display for TrainError {
         let message = match self {
             Self::EmptyDataset => "training requires at least one sample",
             Self::InvalidLearningRate => "learning rate must be finite and positive",
+            Self::NonFinitePrediction => "training prediction was not finite",
         };
         f.write_str(message)
     }
@@ -85,10 +92,14 @@ impl std::error::Error for InvalidWeights {}
 /// A model returned a non-finite score.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PredictError {
-    /// Fill probability was NaN or infinite.
-    NonFiniteFillProbability,
+    /// Fill probability was NaN, infinite, or outside `[0, 1]`.
+    InvalidProbability,
     /// Conditional P&L was NaN or infinite.
     NonFiniteConditionalPnl,
+    /// Feature extraction failed.
+    InvalidFeatures,
+    /// The product of probability and conditional P&L was not finite.
+    NonFiniteExpectedValue,
     /// The output slice length did not match the candidate slice.
     CandidateCountMismatch,
 }
@@ -96,8 +107,10 @@ pub enum PredictError {
 impl fmt::Display for PredictError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
-            Self::NonFiniteFillProbability => "fill probability must be finite",
+            Self::InvalidProbability => "fill probability must be finite and inside [0, 1]",
             Self::NonFiniteConditionalPnl => "conditional pnl must be finite",
+            Self::InvalidFeatures => "features could not be extracted",
+            Self::NonFiniteExpectedValue => "expected value is not finite",
             Self::CandidateCountMismatch => "candidate and output slices have different lengths",
         };
         f.write_str(message)
@@ -109,9 +122,9 @@ impl std::error::Error for PredictError {}
 /// Scores one candidate from a market state whose reference price is already set.
 ///
 /// Feature extraction and both predictions allocate nothing. The reference
-/// price is read from `market` and is not estimated again. Fill probability
-/// is clamped into `[0, 1]` before the product. The result is a shadow score,
-/// not an order.
+/// price is read from `market` and is not estimated again. Invalid model
+/// output is returned as an error and is not clamped into a score.
+/// The result is a shadow score, not an order.
 pub fn predict_quote<F, P>(
     market: &MarketState,
     quote: &CandidateQuote,
@@ -122,21 +135,22 @@ where
     F: FillProbabilityModel<FEATURE_COUNT>,
     P: ConditionalPnlModel<FEATURE_COUNT>,
 {
-    let features = extract_features(market, quote);
-    let probability = fill_model.predict_fill_probability(&features);
-    if !probability.is_finite() {
-        return Err(PredictError::NonFiniteFillProbability);
+    let features = extract_features(market, quote).map_err(feature_error)?;
+    let fill_probability = fill_model.predict_fill_probability(&features)?;
+    let conditional = pnl_model.predict_pnl_if_filled(&features)?;
+    let expected_value = fill_probability.get() * conditional.get();
+    if !expected_value.is_finite() {
+        return Err(PredictError::NonFiniteExpectedValue);
     }
-    let conditional = pnl_model.predict_pnl_if_filled(&features);
-    if !conditional.is_finite() {
-        return Err(PredictError::NonFiniteConditionalPnl);
-    }
-    let fill_probability = probability.clamp(0.0, 1.0);
     Ok(QuotePrediction {
         fill_probability,
         expected_pnl_if_filled: conditional,
-        expected_value: fill_probability * conditional,
+        expected_value,
     })
+}
+
+fn feature_error(_: FeatureError) -> PredictError {
+    PredictError::InvalidFeatures
 }
 
 /// Scores every candidate against one already-estimated market state.
@@ -189,6 +203,7 @@ mod tests {
     use crate::linear::LinearRegression;
     use crate::logistic::LogisticRegression;
     use crate::selection::{select_action, ActionScore, QuoteDecision};
+    use crate::units::{Pnl, Probability};
     use crate::StrategyId;
 
     #[test]
@@ -198,11 +213,12 @@ mod tests {
             .unwrap();
         let quote = CandidateQuote::new(99.8, 1.0).unwrap();
         let other = CandidateQuote::new(99.7, 1.0).unwrap();
-        let mut scored = [QuotePrediction {
-            fill_probability: 0.0,
-            expected_pnl_if_filled: 0.0,
+        let zero = QuotePrediction {
+            fill_probability: Probability::new(0.0).unwrap(),
+            expected_pnl_if_filled: Pnl::new(0.0).unwrap(),
             expected_value: 0.0,
-        }; 2];
+        };
+        let mut scored = [zero; 2];
         score_candidates(
             &market,
             &[quote, other],
@@ -211,7 +227,10 @@ mod tests {
             &mut scored,
         )
         .unwrap();
-        assert_eq!(scored[0].fill_probability, scored[1].fill_probability);
+        assert_eq!(
+            scored[0].fill_probability.get(),
+            scored[1].fill_probability.get()
+        );
         assert_eq!(
             market.fair_value(),
             FairValueMethod::Microprice
@@ -222,11 +241,11 @@ mod tests {
         let pnl_model = LinearRegression::from_weights(0.4, [0.0; FEATURE_COUNT]).unwrap();
 
         let prediction = predict_quote(&market, &quote, &fill_model, &pnl_model).unwrap();
-        assert_eq!(prediction.fill_probability, 0.5);
-        assert_eq!(prediction.expected_pnl_if_filled, 0.4);
+        assert_eq!(prediction.fill_probability.get(), 0.5);
+        assert_eq!(prediction.expected_pnl_if_filled.get(), 0.4);
         assert_eq!(
             prediction.expected_value,
-            prediction.fill_probability * prediction.expected_pnl_if_filled
+            prediction.fill_probability.get() * prediction.expected_pnl_if_filled.get()
         );
 
         let better = StrategyId::new("B").unwrap();

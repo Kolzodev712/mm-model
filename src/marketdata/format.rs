@@ -27,26 +27,23 @@
 //! A trailing partial record is ignored on read. Encode writes one stack
 //! buffer and does not build a JSON document.
 //!
-//! An `MMFV` log, when present, is a legacy series of caller-supplied prices.
-//! Dataset construction does not read it. Each record is `i64` local time then
-//! `f64` price (16 bytes).
+//! [`BookLogWriter`] flushes after a configured number of records. It does not
+//! `fsync` each update. A crash can lose the records still in the process or
+//! operating-system buffer.
 
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
-use super::book::{
-    BookError, BookRecord, BookStamp, FairValueRecord, Instrument, Level, BOOK_DEPTH,
-};
+use super::book::{BookError, BookRecord, BookStamp, Instrument, Level, BOOK_DEPTH};
 
 /// Bytes in a book-log header.
 pub const BOOK_HEADER_LEN: usize = 12;
 /// Bytes in one book record.
 pub const BOOK_RECORD_LEN: usize = 384;
-/// Bytes in one fair-value record.
-pub const FAIR_RECORD_LEN: usize = 16;
 
 const BOOK_MAGIC: &[u8; 4] = b"MMBK";
-const FAIR_MAGIC: &[u8; 4] = b"MMFV";
 const VERSION: u16 = 1;
 const FLAG_EVENT: u8 = 0b0000_0001;
 const FLAG_UPDATE: u8 = 0b0000_0010;
@@ -70,6 +67,8 @@ pub enum LogError {
     UnexpectedRecordLen(u32),
     /// A full record could not be decoded.
     CorruptRecord,
+    /// Flush interval was zero.
+    InvalidFlush,
 }
 
 impl fmt::Display for LogError {
@@ -83,6 +82,7 @@ impl fmt::Display for LogError {
             Self::UnexpectedDepth(depth) => write!(f, "unexpected book depth {depth}"),
             Self::UnexpectedRecordLen(len) => write!(f, "unexpected record length {len}"),
             Self::CorruptRecord => f.write_str("log record is corrupt"),
+            Self::InvalidFlush => f.write_str("flush interval must be at least one record"),
         }
     }
 }
@@ -178,42 +178,71 @@ pub fn read_book_log<R: Read>(reader: &mut R) -> Result<Vec<BookRecord>, LogErro
     Ok(records)
 }
 
-/// Writes a version-1 fair-value header.
-pub fn write_fair_value_header<W: Write>(writer: &mut W) -> io::Result<()> {
-    let mut header = [0u8; BOOK_HEADER_LEN];
-    encode_header(&mut header, FAIR_MAGIC, 0, FAIR_RECORD_LEN as u32);
-    writer.write_all(&header)
+/// Appends fixed-size book records and flushes in batches.
+pub struct BookLogWriter {
+    file: File,
+    encoded: [u8; BOOK_RECORD_LEN],
+    pending: u32,
+    flush_every: u32,
 }
 
-/// Encodes one fair-value record into a 16-byte buffer.
-pub fn encode_fair_value(record: FairValueRecord, dest: &mut [u8]) -> Result<(), LogError> {
-    if dest.len() != FAIR_RECORD_LEN {
-        return Err(LogError::UnexpectedRecordLen(dest.len() as u32));
+impl BookLogWriter {
+    /// Opens or creates a book log. `flush_every` must be at least 1.
+    pub fn open(path: &Path, flush_every: u32) -> Result<Self, LogError> {
+        if flush_every == 0 {
+            return Err(LogError::InvalidFlush);
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        prepare_book_file(&mut file)?;
+        Ok(Self {
+            file,
+            encoded: [0; BOOK_RECORD_LEN],
+            pending: 0,
+            flush_every,
+        })
     }
-    write_i64(dest, 0, record.local_receive_ns());
-    write_f64(dest, 8, record.fair_value());
+
+    /// Encodes `record` into the reused buffer and appends it.
+    pub fn write(&mut self, record: &BookRecord) -> Result<(), LogError> {
+        encode_book_record(record, &mut self.encoded)?;
+        self.file.write_all(&self.encoded)?;
+        self.pending += 1;
+        if self.pending >= self.flush_every {
+            self.file.flush()?;
+            self.pending = 0;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BookLogWriter {
+    fn drop(&mut self) {
+        let _ = self.file.flush();
+    }
+}
+
+fn prepare_book_file(file: &mut File) -> Result<(), LogError> {
+    let len = file.metadata()?.len();
+    if len == 0 {
+        write_book_header(file)?;
+        file.flush()?;
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = [0u8; BOOK_HEADER_LEN];
+    file.read_exact(&mut header)?;
+    decode_book_header(&header)?;
+    let aligned = aligned_book_file_len(len)?;
+    if aligned != len {
+        file.set_len(aligned)?;
+    }
+    file.seek(SeekFrom::Start(aligned))?;
     Ok(())
-}
-
-/// Reads a fair-value log. A short tail is discarded.
-pub fn read_fair_value_log<R: Read>(reader: &mut R) -> Result<Vec<FairValueRecord>, LogError> {
-    let mut header = [0u8; BOOK_HEADER_LEN];
-    match read_full(reader, &mut header)? {
-        ReadFull::Eof => return Err(LogError::Empty),
-        ReadFull::Partial => return Err(LogError::TruncatedHeader),
-        ReadFull::Full => decode_header(&header, FAIR_MAGIC, 0, FAIR_RECORD_LEN as u32)?,
-    }
-    let mut records = Vec::new();
-    let mut raw = [0u8; FAIR_RECORD_LEN];
-    while let ReadFull::Full = read_full(reader, &mut raw)? {
-        let local_receive_ns = read_i64(&raw, 0)?;
-        let fair_value = read_f64(&raw, 8)?;
-        records.push(
-            FairValueRecord::new(local_receive_ns, fair_value)
-                .map_err(|_| LogError::CorruptRecord)?,
-        );
-    }
-    Ok(records)
 }
 
 fn encode_header(dest: &mut [u8], magic: &[u8; 4], depth: u16, record_len: u32) {
@@ -442,18 +471,5 @@ mod tests {
             decode_book_header(&header),
             Err(LogError::BadMagic)
         ));
-    }
-
-    #[test]
-    fn fair_value_log_roundtrip() {
-        let record = FairValueRecord::new(42, 100.25).unwrap();
-        let mut bytes = Vec::new();
-        write_fair_value_header(&mut bytes).unwrap();
-        let mut raw = [0u8; FAIR_RECORD_LEN];
-        encode_fair_value(record, &mut raw).unwrap();
-        bytes.extend_from_slice(&raw);
-        bytes.extend_from_slice(&[9, 9]);
-        let decoded = read_fair_value_log(&mut bytes.as_slice()).unwrap();
-        assert_eq!(decoded, vec![record]);
     }
 }

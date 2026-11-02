@@ -24,9 +24,10 @@
 
 use crate::features::FeatureVector;
 use crate::model::{
-    finite_weights, validate_train_config, FillProbabilityModel, InvalidWeights, TrainConfig,
-    TrainError,
+    finite_weights, validate_train_config, FillProbabilityModel, InvalidWeights, PredictError,
+    TrainConfig, TrainError,
 };
+use crate::units::Probability;
 
 /// One fill observation already turned into features.
 ///
@@ -82,7 +83,10 @@ impl<const N: usize> LogisticRegression<N> {
         }
         let mut total = 0.0;
         for sample in samples {
-            let probability = self.predict_fill_probability(&sample.features);
+            let probability = self
+                .predict_probability(&sample.features)
+                .map_err(|_| TrainError::NonFinitePrediction)?
+                .get();
             total += binary_cross_entropy(sample_label(sample.filled), probability);
         }
         Ok(total / samples.len() as f64)
@@ -107,7 +111,10 @@ impl<const N: usize> LogisticRegression<N> {
             let mut bias_grad = 0.0;
             let mut weight_grad = [0.0; N];
             for sample in samples {
-                let probability = self.predict_fill_probability(&sample.features);
+                let probability = self
+                    .predict_probability(&sample.features)
+                    .map_err(|_| TrainError::NonFinitePrediction)?
+                    .get();
                 let residual = probability - sample_label(sample.filled);
                 bias_grad += residual;
                 for (gradient, value) in weight_grad.iter_mut().zip(sample.features.as_array()) {
@@ -123,9 +130,21 @@ impl<const N: usize> LogisticRegression<N> {
     }
 }
 
-impl<const N: usize> FillProbabilityModel<N> for LogisticRegression<N> {
-    fn predict_fill_probability(&self, features: &FeatureVector<N>) -> f64 {
+impl<const N: usize> LogisticRegression<N> {
+    fn predict_probability(
+        &self,
+        features: &FeatureVector<N>,
+    ) -> Result<Probability, PredictError> {
         sigmoid(self.bias + features.dot(&self.weights))
+    }
+}
+
+impl<const N: usize> FillProbabilityModel<N> for LogisticRegression<N> {
+    fn predict_fill_probability(
+        &self,
+        features: &FeatureVector<N>,
+    ) -> Result<Probability, PredictError> {
+        self.predict_probability(features)
     }
 }
 
@@ -137,12 +156,13 @@ fn sample_label(filled: bool) -> f64 {
     }
 }
 
-/// Numerically stable logistic sigmoid, returned in `[0, 1]`.
+/// Numerically stable logistic sigmoid.
 ///
-/// Non-finite `z` yields `0.5` for NaN and `0` or `1` for infinities, so a
-/// probability never leaves the unit interval.
-#[must_use]
-pub fn sigmoid(z: f64) -> f64 {
+/// A non-finite linear score is an error. It is not replaced with `0.5`.
+pub fn sigmoid(z: f64) -> Result<Probability, PredictError> {
+    if !z.is_finite() {
+        return Err(PredictError::InvalidProbability);
+    }
     let probability = if z >= 0.0 {
         let exp_neg = (-z).exp();
         1.0 / (1.0 + exp_neg)
@@ -150,15 +170,7 @@ pub fn sigmoid(z: f64) -> f64 {
         let exp_pos = z.exp();
         exp_pos / (1.0 + exp_pos)
     };
-    if probability.is_finite() {
-        probability.clamp(0.0, 1.0)
-    } else if z.is_nan() {
-        0.5
-    } else if z.is_sign_positive() {
-        1.0
-    } else {
-        0.0
-    }
+    Probability::new(probability).map_err(|_| PredictError::InvalidProbability)
 }
 
 fn binary_cross_entropy(label: f64, probability: f64) -> f64 {
@@ -201,19 +213,22 @@ mod tests {
     fn zero_weights_predict_one_half() {
         let model = LogisticRegression::<4>::zeros();
         let features = FeatureVector::new([3.0, -1.0, 0.5, 8.0]).unwrap();
-        assert_eq!(model.predict_fill_probability(&features), 0.5);
+        assert_eq!(
+            model.predict_fill_probability(&features).unwrap().get(),
+            0.5
+        );
     }
 
     #[test]
     fn probabilities_stay_inside_the_unit_interval() {
         let model = LogisticRegression::from_weights(0.0, [50.0]).unwrap();
         for value in [-1.0e6, -10.0, 0.0, 10.0, 1.0e6] {
-            let probability = model.predict_fill_probability(&row(value));
+            let probability = model.predict_fill_probability(&row(value)).unwrap().get();
             assert!((0.0..=1.0).contains(&probability));
         }
-        assert_eq!(sigmoid(f64::INFINITY), 1.0);
-        assert_eq!(sigmoid(f64::NEG_INFINITY), 0.0);
-        assert_eq!(sigmoid(f64::NAN), 0.5);
+        assert!(sigmoid(f64::INFINITY).is_err());
+        assert!(sigmoid(f64::NEG_INFINITY).is_err());
+        assert!(sigmoid(f64::NAN).is_err());
     }
 
     #[test]

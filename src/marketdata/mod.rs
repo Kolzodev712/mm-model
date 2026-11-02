@@ -9,13 +9,19 @@ mod binance;
 mod book;
 mod format;
 
-pub use binance::{parse_partial_depth, ParseError, BINANCE_EXCHANGE, BTCUSDT, PARTIAL_DEPTH_URL};
+#[cfg(feature = "live")]
+mod binance_client;
+#[cfg(feature = "live")]
+pub use binance_client::{BinanceBookClient, ClientError};
+
+pub use binance::{
+    parse_partial_depth, BinanceBookConfig, ParseError, BINANCE_EXCHANGE, BINANCE_SPOT_WS, BTCUSDT,
+    PARTIAL_DEPTH_URL,
+};
 pub use book::{
-    BookError, BookRecord, BookStamp, FairValueRecord, Instrument, Level, NameError, ParsedDepth,
-    BOOK_DEPTH,
+    BookError, BookRecord, BookStamp, Instrument, Level, NameError, ParsedDepth, BOOK_DEPTH,
 };
 pub use format::{
-    aligned_book_file_len, decode_book_header, encode_book_record, encode_fair_value,
-    read_book_log, read_fair_value_log, write_book_header, write_fair_value_header, LogError,
-    BOOK_HEADER_LEN, BOOK_RECORD_LEN, FAIR_RECORD_LEN,
+    aligned_book_file_len, decode_book_header, encode_book_record, read_book_log,
+    write_book_header, BookLogWriter, LogError, BOOK_HEADER_LEN, BOOK_RECORD_LEN,
 };

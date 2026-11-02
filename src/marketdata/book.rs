@@ -240,39 +240,6 @@ impl ParsedDepth {
     }
 }
 
-/// Legacy on-disk fair-value sample.
-///
-/// The learned dataset builder does not read this record. Reference prices for
-/// training are estimated from [`BookRecord`].
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct FairValueRecord {
-    local_receive_ns: i64,
-    fair_value: f64,
-}
-
-impl FairValueRecord {
-    /// Stores a finite, strictly positive fair value.
-    pub fn new(local_receive_ns: i64, fair_value: f64) -> Result<Self, BookError> {
-        if !fair_value.is_finite() || fair_value <= 0.0 {
-            return Err(BookError::InvalidFairValue);
-        }
-        Ok(Self {
-            local_receive_ns,
-            fair_value,
-        })
-    }
-
-    #[must_use]
-    pub fn local_receive_ns(self) -> i64 {
-        self.local_receive_ns
-    }
-
-    #[must_use]
-    pub fn fair_value(self) -> f64 {
-        self.fair_value
-    }
-}
-
 /// A name did not fit the fixed 16-byte buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NameError;
@@ -285,7 +252,7 @@ impl fmt::Display for NameError {
 
 impl std::error::Error for NameError {}
 
-/// A book or fair-value record violated its layout rules.
+/// A book record violated its layout rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BookError {
     /// A side had more levels than [`BOOK_DEPTH`], or a counted level was not tradable.
@@ -294,8 +261,6 @@ pub enum BookError {
     Unordered,
     /// Exchange event milliseconds did not fit in unix nanoseconds.
     Timestamp,
-    /// Fair value was non-positive or not finite.
-    InvalidFairValue,
     /// A stored name was not valid ASCII.
     Name,
 }
@@ -306,7 +271,6 @@ impl fmt::Display for BookError {
             Self::InvalidLevel => "book level is missing, non-positive, or not finite",
             Self::Unordered => "book levels must be strictly best-first",
             Self::Timestamp => "exchange event time does not fit in unix nanoseconds",
-            Self::InvalidFairValue => "fair value must be finite and positive",
             Self::Name => "stored instrument name is not ASCII",
         };
         f.write_str(message)

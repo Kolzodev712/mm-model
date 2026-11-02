@@ -20,9 +20,10 @@
 
 use crate::features::FeatureVector;
 use crate::model::{
-    finite_weights, validate_train_config, ConditionalPnlModel, InvalidWeights, TrainConfig,
-    TrainError,
+    finite_weights, validate_train_config, ConditionalPnlModel, InvalidWeights, PredictError,
+    TrainConfig, TrainError,
 };
+use crate::units::Pnl;
 
 /// P&L of one fill, already paired with decision-time features.
 ///
@@ -71,10 +72,10 @@ impl<const N: usize> LinearRegression<N> {
         &self.weights
     }
 
-    /// Prediction `bias + w · x`.
-    #[must_use]
-    pub fn predict(&self, features: &FeatureVector<N>) -> f64 {
-        self.bias + features.dot(&self.weights)
+    /// Prediction `bias + w · x`. Non-finite results are errors.
+    pub fn predict(&self, features: &FeatureVector<N>) -> Result<Pnl, PredictError> {
+        let value = self.bias + features.dot(&self.weights);
+        Pnl::new(value).map_err(|_| PredictError::NonFiniteConditionalPnl)
     }
 
     /// Mean squared error of the current parameters.
@@ -84,7 +85,11 @@ impl<const N: usize> LinearRegression<N> {
         }
         let mut total = 0.0;
         for sample in samples {
-            let error = self.predict(&sample.features) - sample.pnl;
+            let error = self
+                .predict(&sample.features)
+                .map_err(|_| TrainError::NonFinitePrediction)?
+                .get()
+                - sample.pnl;
             total += error * error;
         }
         Ok(total / samples.len() as f64)
@@ -109,7 +114,11 @@ impl<const N: usize> LinearRegression<N> {
             let mut bias_grad = 0.0;
             let mut weight_grad = [0.0; N];
             for sample in samples {
-                let residual = 2.0 * (self.predict(&sample.features) - sample.pnl);
+                let predicted = self
+                    .predict(&sample.features)
+                    .map_err(|_| TrainError::NonFinitePrediction)?
+                    .get();
+                let residual = 2.0 * (predicted - sample.pnl);
                 bias_grad += residual;
                 for (gradient, value) in weight_grad.iter_mut().zip(sample.features.as_array()) {
                     *gradient += residual * value;
@@ -125,7 +134,7 @@ impl<const N: usize> LinearRegression<N> {
 }
 
 impl<const N: usize> ConditionalPnlModel<N> for LinearRegression<N> {
-    fn predict_pnl_if_filled(&self, features: &FeatureVector<N>) -> f64 {
+    fn predict_pnl_if_filled(&self, features: &FeatureVector<N>) -> Result<Pnl, PredictError> {
         self.predict(features)
     }
 }
@@ -155,7 +164,7 @@ mod tests {
         let model = LinearRegression::from_weights(1.5, [2.0, 0.0, -1.0, 4.0]).unwrap();
         let features = FeatureVector::new([3.0, 10.0, 4.0, 0.5]).unwrap();
         let expected = 1.5 + 2.0 * 3.0 - 4.0 + 4.0 * 0.5;
-        assert_eq!(model.predict(&features), expected);
+        assert_eq!(model.predict(&features).unwrap().get(), expected);
     }
 
     #[test]

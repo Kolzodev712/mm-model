@@ -70,10 +70,17 @@ pub struct LabelTiming {
 
 impl LabelTiming {
     /// How much later the horizon snapshot is than `t + H`.
-    #[must_use]
-    pub fn horizon_offset_ns(self) -> i64 {
+    ///
+    /// Overflow or a horizon before the target is an error, not a saturated duration.
+    pub fn horizon_offset_ns(self) -> Result<i64, ExampleError> {
+        let target = self
+            .decision_ns
+            .checked_add(self.requested_horizon_ns)
+            .ok_or(ExampleError::InvalidTiming)?;
         self.horizon_snapshot_ns
-            .saturating_sub(self.decision_ns.saturating_add(self.requested_horizon_ns))
+            .checked_sub(target)
+            .filter(|offset| *offset >= 0)
+            .ok_or(ExampleError::InvalidTiming)
     }
 }
 
@@ -201,7 +208,8 @@ pub fn logistic_samples(
             return Err(ExampleError::MixedFairValueMethod);
         }
         samples.push(FillSample {
-            features: extract_features(&example.inputs.market, &example.inputs.quote),
+            features: extract_features(&example.inputs.market, &example.inputs.quote)
+                .map_err(|_| ExampleError::InvalidFeatures)?,
             filled: matches!(example.outcome, ObservedOutcome::Filled { .. }),
         });
     }
@@ -227,7 +235,8 @@ pub fn pnl_samples(
         }
         if let ObservedOutcome::Filled { pnl, .. } = example.outcome {
             samples.push(PnlSample {
-                features: extract_features(&example.inputs.market, &example.inputs.quote),
+                features: extract_features(&example.inputs.market, &example.inputs.quote)
+                    .map_err(|_| ExampleError::InvalidFeatures)?,
                 pnl,
             });
         }
@@ -248,6 +257,10 @@ pub enum ExampleError {
     MixedFairValueMethod,
     /// The declared method does not match the market state's estimator.
     FairValueMethodMismatch,
+    /// Decision-time inputs did not produce a feature row.
+    InvalidFeatures,
+    /// A timestamp combination overflowed or went backwards.
+    InvalidTiming,
 }
 
 impl fmt::Display for ExampleError {
@@ -264,6 +277,8 @@ impl fmt::Display for ExampleError {
             Self::FairValueMethodMismatch => {
                 "training row estimator does not match its market state"
             }
+            Self::InvalidFeatures => "training row did not produce finite features",
+            Self::InvalidTiming => "label timing overflowed or is out of order",
         };
         f.write_str(message)
     }

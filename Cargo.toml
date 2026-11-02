@@ -6,13 +6,28 @@ description = "Market-making quote baselines: historical EV and small learned mo
 readme = "README.md"
 
 [dependencies]
+clap = { version = "4", optional = true, features = ["derive"] }
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_json = { version = "1", optional = true }
+signal-hook = { version = "0.3", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter", "fmt"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
 tungstenite = { version = "0.30", optional = true, default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 
 [features]
 default = []
-recorder = ["dep:tungstenite"]
+live = ["dep:tungstenite", "dep:rustls"]
+cli = ["dep:clap"]
+observe = ["dep:tracing", "dep:tracing-subscriber", "dep:signal-hook"]
+artifact = ["dep:serde", "dep:serde_json"]
 
 [[bin]]
 name = "record_book"
 path = "src/bin/record_book.rs"
-required-features = ["recorder"]
+required-features = ["live", "cli"]
+
+[[bin]]
+name = "mm-shadow"
+path = "src/bin/mm-shadow.rs"
+required-features = ["live", "cli", "observe", "artifact"]

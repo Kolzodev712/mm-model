@@ -88,6 +88,49 @@ pub fn select_action(actions: &[ActionScore<'_>]) -> QuoteDecision {
     )
 }
 
+/// Copyable learned-candidate choice. No strategy-name string is cloned.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LearnedChoice {
+    /// Do not quote. Expected value is 0.
+    NoQuote,
+    /// The candidate with the highest expected value.
+    Quote {
+        id: crate::units::CandidateId,
+        expected_value: f64,
+    },
+}
+
+/// One learned candidate score.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScoredCandidate {
+    pub id: crate::units::CandidateId,
+    pub expected_value: f64,
+}
+
+/// Selects among learned candidates with the same rule as [`select_quote`].
+///
+/// Ties keep the smaller [`crate::units::CandidateId`]. This function does not allocate.
+#[must_use]
+pub fn select_learned(scores: &[ScoredCandidate]) -> LearnedChoice {
+    let best = scores
+        .iter()
+        .filter(|score| score.expected_value.is_finite())
+        .reduce(
+            |best, candidate| match candidate.expected_value.total_cmp(&best.expected_value) {
+                Ordering::Greater => candidate,
+                Ordering::Equal if candidate.id < best.id => candidate,
+                _ => best,
+            },
+        );
+    match best {
+        Some(score) if score.expected_value > 0.0 => LearnedChoice::Quote {
+            id: score.id,
+            expected_value: score.expected_value,
+        },
+        _ => LearnedChoice::NoQuote,
+    }
+}
+
 fn select_ranked<'a>(candidates: impl Iterator<Item = (&'a StrategyId, f64)>) -> QuoteDecision {
     let best = candidates
         .filter(|(_, expected_value)| expected_value.is_finite())

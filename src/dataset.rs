@@ -91,15 +91,46 @@ impl QuoteEvent {
 pub struct DatasetConfig {
     method: FairValueMethod,
     horizon_ns: i64,
+    max_decision_staleness_ns: i64,
+    max_horizon_slippage_ns: i64,
 }
+
+const DEFAULT_DECISION_STALENESS_NS: i64 = 5_000_000_000;
+const DEFAULT_HORIZON_SLIPPAGE_NS: i64 = 5_000_000_000;
 
 impl DatasetConfig {
     /// `horizon_ns` is `H` and must be strictly positive.
     pub fn new(method: FairValueMethod, horizon_ns: i64) -> Result<Self, BuildError> {
+        Self::with_limits(
+            method,
+            horizon_ns,
+            DEFAULT_DECISION_STALENESS_NS,
+            DEFAULT_HORIZON_SLIPPAGE_NS,
+        )
+    }
+
+    /// Same as [`Self::new`] with explicit staleness and slippage caps.
+    ///
+    /// A decision book older than `max_decision_staleness_ns`, or a horizon
+    /// book later than `t + H` by more than `max_horizon_slippage_ns`, is rejected.
+    pub fn with_limits(
+        method: FairValueMethod,
+        horizon_ns: i64,
+        max_decision_staleness_ns: i64,
+        max_horizon_slippage_ns: i64,
+    ) -> Result<Self, BuildError> {
         if horizon_ns <= 0 {
             return Err(BuildError::NonPositiveHorizon);
         }
-        Ok(Self { method, horizon_ns })
+        if max_decision_staleness_ns < 0 || max_horizon_slippage_ns < 0 {
+            return Err(BuildError::InvalidTimingLimit);
+        }
+        Ok(Self {
+            method,
+            horizon_ns,
+            max_decision_staleness_ns,
+            max_horizon_slippage_ns,
+        })
     }
 
     /// Microprice, the default experimental estimator, with horizon `H`.
@@ -190,6 +221,29 @@ pub fn build_training_examples(
             ask.price,
             ask.quantity,
         );
+        let decision_age = quote
+            .decision_ns()
+            .checked_sub(decision.stamp().local_receive_ns)
+            .filter(|age| *age >= 0)
+            .ok_or(BuildError::InvalidTiming)?;
+        if decision_age > config.max_decision_staleness_ns {
+            return Err(BuildError::StaleDecision {
+                decision_ns: quote.decision_ns(),
+                age_ns: decision_age,
+            });
+        }
+        let slippage = horizon
+            .stamp()
+            .local_receive_ns
+            .checked_sub(target_ns)
+            .filter(|slip| *slip >= 0)
+            .ok_or(BuildError::InvalidTiming)?;
+        if slippage > config.max_horizon_slippage_ns {
+            return Err(BuildError::LateHorizon {
+                target_ns,
+                slippage_ns: slippage,
+            });
+        }
         let outcome =
             outcome_from_facts(quote.facts(), quote.quote().quantity(), horizon_fair_value)?;
         let timing = LabelTiming {
@@ -241,6 +295,14 @@ pub enum BuildError {
     InvalidBook(FairValueError),
     /// The execution price or fees could not form a label.
     InvalidExample,
+    /// A timing limit was negative.
+    InvalidTimingLimit,
+    /// Timestamp arithmetic overflowed or went backwards.
+    InvalidTiming,
+    /// The decision book was older than the configured staleness limit.
+    StaleDecision { decision_ns: i64, age_ns: i64 },
+    /// The horizon book was later than the configured slippage limit.
+    LateHorizon { target_ns: i64, slippage_ns: i64 },
 }
 
 impl fmt::Display for BuildError {
@@ -266,6 +328,18 @@ impl fmt::Display for BuildError {
             }
             Self::InvalidBook(err) => write!(f, "book snapshot was rejected: {err}"),
             Self::InvalidExample => f.write_str("quote outcome is not a valid training row"),
+            Self::InvalidTimingLimit => f.write_str("timing limits must be non-negative"),
+            Self::InvalidTiming => f.write_str("book timestamps are out of order or overflowed"),
+            Self::StaleDecision { decision_ns, age_ns } => {
+                write!(f, "decision book for {decision_ns} is stale by {age_ns} ns")
+            }
+            Self::LateHorizon {
+                target_ns,
+                slippage_ns,
+            } => write!(
+                f,
+                "horizon book for {target_ns} slipped by {slippage_ns} ns"
+            ),
         }
     }
 }
@@ -423,7 +497,7 @@ mod tests {
         assert_eq!(row.timing().decision_snapshot_ns, 1_000);
         assert_eq!(row.timing().requested_horizon_ns, 500);
         assert_eq!(row.timing().horizon_snapshot_ns, 1_600);
-        assert_eq!(row.timing().horizon_offset_ns(), 100);
+        assert_eq!(row.timing().horizon_offset_ns().unwrap(), 100);
         match row.outcome() {
             ObservedOutcome::Filled {
                 pnl,
@@ -506,6 +580,46 @@ mod tests {
                 DatasetConfig::microprice(500).unwrap()
             ),
             Err(BuildError::MixedProvenance)
+        );
+    }
+
+    #[test]
+    fn stale_decision_book_is_rejected() {
+        let books = [
+            book(0, 99.9, 1.0, 100.1, 1.0),
+            book(20_000, 99.9, 1.0, 100.1, 1.0),
+        ];
+        let quote = QuoteEvent::new(
+            10_000,
+            CandidateQuote::new(99.8, 1.0).unwrap(),
+            LabelProvenance::Observed,
+            FillFacts::Unfilled,
+        );
+        let config =
+            DatasetConfig::with_limits(FairValueMethod::Microprice, 500, 1_000, 1_000).unwrap();
+        assert_eq!(
+            build_training_examples(&books, &[quote], config),
+            Err(BuildError::StaleDecision {
+                decision_ns: 10_000,
+                age_ns: 10_000,
+            })
+        );
+    }
+
+    #[test]
+    fn late_horizon_book_is_rejected() {
+        let books = [
+            book(1_000, 99.9, 1.0, 100.1, 1.0),
+            book(5_000, 101.0, 1.0, 101.2, 1.0),
+        ];
+        let config =
+            DatasetConfig::with_limits(FairValueMethod::Microprice, 500, 5_000, 100).unwrap();
+        assert_eq!(
+            build_training_examples(&books, &[filled_quote()], config),
+            Err(BuildError::LateHorizon {
+                target_ns: 1_500,
+                slippage_ns: 3_500,
+            })
         );
     }
 }

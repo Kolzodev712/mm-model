@@ -1,217 +1,159 @@
 # Market-making quote baselines
 
-Reference code for scoring buy quotes on one instrument. This is not an
-optimal quoting model. It is a place to study two estimators that feed the
-same deterministic decision rule.
+This repository is a study bench for buy-quote scoring. It is not an optimal
+quoting system and it does not trade.
 
 ```text
-Binance BTCUSDT book
-        |
-        v
-FairValueMethod (microprice by default)
-        |
-       FV_t
-        |
-        +----------------------+
-        |                      |
-        v                      v
- feature generation      CandidateQuote
-        |                      |
-        +----------+-----------+
-                   |
-                   v
-        logistic P(fill), linear E[P&L | fill]
-                   |
-                   v
-        EV = P(fill) * E[P&L | fill]
-                   |
-                   v
-   deterministic selection against NoQuote (EV = 0)
+                  Binance
+                     |
+                     v
+             BinanceBookClient
+                     |
+                     v
+                BookRecord
+                     |
+                     v
+            FairValueMethod
+                     |
+                     v
+                MarketState
+                     |
+              CandidateGenerator
+                     |
+           +---------+---------+
+           |                   |
+           v                   v
+     Logistic model       Linear model
+       P(fill|X)         E[P&L|fill,X]
+           |                   |
+           +---------+---------+
+                     |
+                     v
+              Expected Value
+                     |
+                     v
+              select / NoQuote
+                     |
+                     v
+             SHADOW LOG ONLY
 ```
 
-The same method applied to the book at `t + H` produces the horizon
-reference price used in training labels.
+No orders are sent. No realized P&L is measured. Public order-book data does
+not provide fill labels for hypothetical quotes. Demo-model output is not
+trading-valid.
 
-Nothing here submits, cancels, or amends orders. A learned score is for
-offline evaluation, replay, or shadow comparison.
+## What is deterministic
 
-## Deterministic historical baseline
-
-The historical formulas are the same benchmark as before. A legacy
-`HistoricalObservation` still stores a horizon price the caller already has.
-The learned pipeline does not. Given quotes that were actually submitted:
+The historical baseline in `domain`, `evaluation`, and `selection` still
+aggregates quotes that were actually submitted:
 
 ```text
 P(fill) = fills / attempts
-
 pnl = (fair_value_at_horizon - execution_price) * quantity - fees
-      (0 when the quote did not fill)
-
-E[P&L | fill] = total filled P&L / fills
-
-EV = P(fill) * E[P&L | fill]
-   = total P&L / attempts
+EV = P(fill) * average filled P&L
 ```
 
-`NoQuote` has EV 0. The highest finite EV above 0 is selected. Equal positive
-EVs use the lexicographically smallest strategy id.
+`HistoricalObservation` still stores a horizon price the caller already has.
+That path is the legacy benchmark. The learned dataset builder does not use it.
 
-These counts are a benchmark. They are not the learned models.
+`NoQuote` has EV 0. The highest finite EV above 0 wins. Learned candidates use
+the same rule through `select_learned`, with a copyable `CandidateId` instead
+of a heap string.
 
-A historical fill at one quote price does not prove whether a different quote
-would have filled at the same moment.
-
-## Learned baseline
-
-Implemented, and intentionally small:
-
-| Piece | Role | Status |
-| --- | --- | --- |
-| `fair_value` | Midpoint and microprice from the best bid and ask | Implemented |
-| `decision` | Top of book plus one estimated reference price | Implemented |
-| `features` | Four relative features, fixed array | Implemented |
-| `logistic` | Fill probability, binary cross-entropy, batch gradient descent | Reference model |
-| `linear` | Conditional P&L, mean squared error, batch gradient descent | Reference model |
-| `model::predict_quote` | One feature row, then `EV = p * conditional P&L` | Implemented |
-| `selection::select_action` | Same rule as the historical selector | Implemented |
-| `trainset` | Decision-time inputs, outcome, observed vs simulated | Implemented |
-| `dataset` | Books plus quote outcomes; both reference prices are estimated | Implemented |
-| `marketdata` | Fixed top-10 book log and Binance payload parser | Implemented |
-| `record_book` | Read-only public websocket recorder | Implemented, experimental |
-| Risk limits, inventory, live orders | | Not implemented |
-
-Logistic regression and linear regression are educational baselines. Fitting
-them does not make the quote optimal.
-
-### Features
-
-All four are known before the order is sent. None use the fill, the execution
-price, or the horizon reference price. Distances are divided by the
-book-derived reference price on that snapshot. The estimator rejects a touch
-with a non-positive quantity, so feature extraction does not divide by zero.
-
-Microprice is a function of the same best-level quantities as
-`top_quantity_imbalance`. The features are correlated. They are both kept so
-that overlap can be measured later.
-
-| Index | Name | Definition | Unit |
-| --- | --- | --- | --- |
-| 0 | `quote_distance_from_fair` | `(fair - quote_price) / fair` | fraction of fair |
-| 1 | `exchange_spread` | `(best_ask - best_bid) / fair` | fraction of fair |
-| 2 | `quote_distance_from_best_bid` | `(quote_price - best_bid) / fair` | fraction of fair |
-| 3 | `top_quantity_imbalance` | `(bid_qty - ask_qty) / (bid_qty + ask_qty)` | dimensionless |
-
-Ask distance is omitted. For a buy it is determined by feature 2 and the
-spread. Candidate quantity is also omitted, so a conditional-P&L label is the
-total mark-to-fair P&L of that fill, not an explicit per-unit model.
-
-Inference is a stack array in and a scalar out. It does not allocate.
-
-### Training
-
-Offline only. There is no path from the websocket into weight updates.
-
-```text
-exchange -> recorder -> book log
-                              \
-quote/fill records ----------> dataset builder
-                              /   one FairValueMethod
-                              \
-                    FV_t from the book at t
-                    FV_(t+H) from the first valid book at or after t+H
-                              \
-                               offline trainer -> weights
-```
-
-The training set records which method produced it. Rows from midpoint and
-microprice are not trained together.
-
-Fill labels are `1` or `0` from a submitted order, or from a row marked
-`Simulated`. The conditional-P&L model is fit only on fills. An unfilled row
-is not given P&L of 0 and passed to that model. Observed and simulated rows
-are rejected if they are handed to one training call together.
-
-Losses:
-
-- fill model: mean binary cross-entropy, full-batch gradient descent
-- P&L model: mean squared error, full-batch gradient descent
-
-Learning rate and epoch count are the only training settings.
-
-## Recorder
-
-`record_book` subscribes to the public Binance spot stream
-
-`wss://stream.binance.com:9443/ws/btcusdt@depth10@100ms`
-
-and appends top-10 bid and ask levels. Each record can store the exchange
-event time and update id when the payload has them. The partial-depth payload
-documented by Binance has `lastUpdateId`, bids, and asks, and no event time,
-so that field is usually empty. Local receive time is always stored.
-
-```text
-cargo run --features recorder --bin record_book -- books.mmbk
-```
-
-The file format is little-endian, version 1, magic `MMBK`, fixed 384-byte
-records. Layout is in `src/marketdata/format.rs`. A short tail from a torn
-write is ignored on read and truncated before the next append. The recorder
-does not write a reference price. An old `MMFV` log of caller-supplied prices
-is still readable and is not an input to training.
-
-The websocket library allocates its own read buffers. This crate does not
-claim those allocations are free. The parser writes into one reused
-fixed-depth struct and does not build a JSON tree.
-
-Raw book data does not label whether an unsubmitted quote would have filled.
-The dataset builder returns an error when quote outcomes are absent. It will
-not invent them from later prices. No live quote/fill recorder exists yet, so
-those labels are not produced by this repository.
-
-## Reference price
-
-`FairValueMethod` is deterministic and reads only the best bid and ask.
-
-Midpoint is `(P_bid + P_ask) / 2`. It ignores displayed size, except that
-both sizes must be strictly positive and the book must be uncrossed.
-Microprice, the default, is
+Reference price is also deterministic. `FairValueMethod::Microprice` is the
+default:
 
 ```text
 (P_ask * Q_bid + P_bid * Q_ask) / (Q_bid + Q_ask)
 ```
 
-A larger bid quantity pulls the price toward the ask. A larger ask quantity
-pulls it toward the bid. When the quantities are equal, microprice matches
-the midpoint. Invalid books return an error. They do not become zero and
-microprice does not fall back to midpoint.
+Midpoint is `(P_bid + P_ask) / 2`. Both reject empty, non-finite, non-positive,
+and locked or crossed books. They do not return 0 and microprice does not fall
+back to midpoint. This price is an exchange-implied reference from the same
+Binance touch used by the features. It is not an independent fair value.
 
-This estimate is an exchange-implied reference price from the same Binance
-book the quote features use. It is not an independent fair value, it can
-repeat information already in the features, and it is not a fundamental or
-cross-market price. A multi-venue composite, a predictive fair-value model,
-or a production engine can replace the enum later. None of those are
-implemented.
+## What is learned
 
-For a training row, `FV_t` comes from the latest valid book at or before the
-decision. `FV_(t+H)` comes from the first valid book at or after `t + H`.
-The row stores the decision time, the requested horizon, the horizon
-snapshot time, and the offset. A filled buy is marked with
+Feature schema v1 has five decision-time ratios:
+
+| Index | Name | Formula |
+| --- | --- | --- |
+| 0 | `quote_distance_from_fair` | `(fair - quote_price) / fair` |
+| 1 | `exchange_spread` | `(best_ask - best_bid) / fair` |
+| 2 | `quote_distance_from_best_bid` | `(quote_price - best_bid) / fair` |
+| 3 | `top_quantity_imbalance` | `(bid_qty - ask_qty) / (bid_qty + ask_qty)` |
+| 4 | `relative_candidate_quantity` | `candidate_quantity / (bid_qty + ask_qty)` |
+
+Logistic regression predicts fill probability. Linear regression predicts
+conditional P&L. Expected value is the product, outside either model. A
+non-finite score is an error. NaN is not turned into 0.5 and an invalid
+probability is not clamped.
+
+Training is offline. A model artifact records the schema version, fair-value
+method, horizon, and weights. A run refuses a file that does not match.
+Observed and simulated labels cannot be trained together.
+
+Dataset alignment uses the latest valid book at or before the decision and the
+first valid book at or after `t + H`. Rows are rejected when the decision book
+is older than `max_decision_staleness` or the horizon book is later than
+`max_horizon_slippage`. Timestamp gaps use checked arithmetic.
+
+## What is live market data
+
+`record_book` appends Binance spot partial depth (top 10, 100 ms by default)
+to a fixed 384-byte `MMBK` log. The symbol and endpoint are client
+configuration. BTCUSDT is only the example default. The writer flushes every
+N records and does not fsync each update, so a crash can drop the last batch.
+
+`mm-shadow` reads the same public stream, derives the reference price,
+scores a fixed basis-point candidate grid, and logs predictions for a bounded
+duration. It does not submit orders, update weights, or claim fills.
 
 ```text
-(FV_(t+H) - execution_price) * quantity - fees
+just shadow --duration 60s --report-every 5s --symbol BTCUSDT --demo-model
 ```
 
-## Deferred
+`--demo-model` trains a deterministic simulated sample at startup and prints
+`DEMO MODEL — predictions are not trading-valid`. `--model ./models/btc.json`
+loads a previously written artifact. One of those two flags is required.
+There is no silent fallback.
 
-Neural nets, learned fair-value models, multi-exchange or trade-flow fair
-value, futures basis, momentum, Kalman filters, depth-weighted fair value,
-boosting, reinforcement learning, online learning, inventory, sell quotes,
-partial fills, queue position, model serving, order entry, and a risk engine.
+A model file can be mounted read-only:
 
-## What to study next
+```text
+docker run --rm -v ./models:/models:ro mm-model-shadow \
+  --duration 5m --report-every 10s --symbol BTCUSDT --model /models/btc.json
+```
 
-Join recorded books with real submitted-quote outcomes and compare microprice
-labels with midpoint labels and with the historical baseline. Measure how
-much of the microprice signal is already in the imbalance feature, and how
-large the horizon offset is on the recorded stream. A fill at one price still
-says nothing by itself about a price that was not sent.
+## Development
+
+```text
+./scripts/install-just.sh
+just fmt
+just clippy
+just tests
+just check
+just docker-build
+just docker-shadow --duration 60s --report-every 5s --symbol BTCUSDT --demo-model
+```
+
+Library features:
+
+| Feature | Dependencies | Used by |
+| --- | --- | --- |
+| `live` | `tungstenite`, `rustls` (ring) | Binance websocket client, `record_book`, `mm-shadow` |
+| `cli` | `clap` | both binaries |
+| `observe` | `tracing`, `tracing-subscriber`, `signal-hook` | `mm-shadow` logs and SIGINT/SIGTERM |
+| `artifact` | `serde`, `serde_json` | model file load/save |
+
+The default library build has no websocket, CLI, or JSON dependency.
+Inference after startup does not allocate: fair value, candidate fill,
+feature extraction, both predictions, the EV product, and learned selection
+use stack buffers supplied by the caller. Networking, logging, training, and
+artifact load may allocate.
+
+## Not in this repository
+
+Order entry, private exchange APIs, inventory, online learning, neural nets,
+multi-venue fair value, and a risk engine. A fill at one price still does not
+prove that a different price would have filled.
