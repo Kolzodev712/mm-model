@@ -1,0 +1,8 @@
+[package]
+name = "mm-model"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic historical baseline for market-making quote evaluation"
+readme = "README.md"
+
+[dependencies]
