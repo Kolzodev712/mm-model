@@ -181,6 +181,22 @@ sample slice. Storage can scan one partition at a time. The trainer is not yet
 a streaming or minibatch algorithm, and it is not suitable for an arbitrarily
 large history. The binary configuration chooses the training window.
 
+A fit is not released for shadow because training loss fell. Rows are split
+chronologically into train, validation, and test. The test slice is not used
+to accept the model. Release requires observed labels, at least 20 examples
+and 5 fills, and validation loss no worse than a constant baseline. Anything
+smaller, or any simulated label set, stays unreleased. That is not evidence
+the model is economically useful.
+
+Price-ratio features are stored in basis points so the reference gradient step
+can move. Under microprice, distance from the best bid is determined by the
+other features and its weight is not separately identified.
+
+Collection appends the open MMBK hour on one thread. Closed hours go to one
+worker on a two-slot channel. A full channel stops the run. It does not drop
+books. Shutdown flushes the open hour and leaves it open. The next process
+can close an hour that is already in the past.
+
 ## Run
 
 ```text
@@ -207,7 +223,8 @@ just docker-up
 ```
 
 The process exits when the configured run ends, and Compose does not restart
-it. `just docker-down` removes the container and leaves `./data` on the host.
+it. The container root filesystem is read-only. `./data` is the writable
+mount. `just docker-down` removes the container and leaves `./data` on the host.
 
 The image is non-root, has no compiler, and opens no inbound port. Historical
 data is not copied into the image. The mounted directory must be writable by

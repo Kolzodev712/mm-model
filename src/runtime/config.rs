@@ -58,8 +58,6 @@ pub struct MarketConfig {
 pub struct StorageConfig {
     pub root: PathBuf,
     pub flush_every: u32,
-    /// Raw partition length. This build accepts one UTC hour only.
-    pub partition_duration: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

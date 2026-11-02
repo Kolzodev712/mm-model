@@ -110,6 +110,12 @@ pub fn read_books(
         let batch = batch.map_err(|_| ParquetError::Read)?;
         books.extend(books_from_batch(&batch)?);
     }
+    if books.iter().any(|book| {
+        book.instrument().exchange() != expect_exchange
+            || book.instrument().symbol() != expect_symbol
+    }) {
+        return Err(ParquetError::Identity);
+    }
     if books.len() as u64 != expected_rows {
         return Err(ParquetError::Schema);
     }
@@ -143,10 +149,11 @@ impl HistoricalBooks for ParquetHistory<'_> {
             range.to_ns,
         );
         for partition in partitions {
-            let Some(path) = partition.parquet_path.as_deref() else {
+            let path = partition.id.parquet_path(self.catalog.root());
+            if !path.is_file() {
                 return Err(ParquetError::Missing);
-            };
-            let books = read_books(Path::new(path), &range.exchange, &range.symbol)?;
+            }
+            let books = read_books(&path, &range.exchange, &range.symbol)?;
             for book in &books {
                 let ts = book.stamp().local_receive_ns;
                 if ts >= range.from_ns && ts <= range.to_ns {

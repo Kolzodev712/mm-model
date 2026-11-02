@@ -244,6 +244,14 @@ pub fn build_training_examples(
                 slippage_ns: slippage,
             });
         }
+        if let FillFacts::Filled {
+            execution_price, ..
+        } = quote.facts()
+        {
+            if execution_price > quote.quote().price() {
+                return Err(BuildError::InvalidExample);
+            }
+        }
         let outcome =
             outcome_from_facts(quote.facts(), quote.quote().quantity(), horizon_fair_value)?;
         let timing = LabelTiming {

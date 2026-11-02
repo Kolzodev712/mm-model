@@ -45,13 +45,13 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stop))?;
     let should_stop = || stop.load(Ordering::Relaxed);
     match config.mode {
-        RunMode::Train => {
-            let mut idle = mm_model::data::market::source::SliceSource::new(Vec::new());
-            let outcomes = run_source(&config, &mut idle, &[], should_stop)?;
-            tracing::info!(results = outcomes.len(), "train mode finished");
+        RunMode::Train | RunMode::CollectAndTrain => {
+            return Err(
+                "this binary has no quote or fill records; public books are not labels".into(),
+            );
         }
         RunMode::Shadow => run_shadow(&config, &should_stop)?,
-        RunMode::Collect | RunMode::CollectAndTrain => {
+        RunMode::Collect => {
             let market = BinanceBookConfig::new(
                 BINANCE_SPOT_WS,
                 config.market.symbol.as_str(),
@@ -85,7 +85,7 @@ fn run_shadow(
     } else {
         let artifact =
             mm_model::model::artifact::ModelArtifact::read_json(&config.shadow.model_path)?;
-        artifact.validate_for_run(config.market.fair_value)?;
+        artifact.validate_for_shadow(config.market.fair_value, config.training.horizon_ns)?;
         artifact.models()?
     };
     let grid = BpsGrid::parse(&config.shadow.offsets_bps, config.shadow.quantity)?;
@@ -103,8 +103,10 @@ fn run_shadow(
     let started = std::time::Instant::now();
     let mut scored = 0u64;
     while !should_stop() && config.run_for.is_none_or(|limit| started.elapsed() < limit) {
-        match client.next_book()? {
-            Some(book) => {
+        match client.next_book() {
+            Err(err) if client.is_idle(&err) => continue,
+            Err(err) => return Err(err.into()),
+            Ok(Some(book)) => {
                 match evaluate_book(
                     &book,
                     config.market.fair_value,
@@ -126,7 +128,7 @@ fn run_shadow(
                     Err(err) => tracing::warn!(error = %err, "shadow skipped a book"),
                 }
             }
-            None => break,
+            Ok(None) => break,
         }
     }
     tracing::info!(
@@ -153,7 +155,6 @@ fn configuration() -> Result<AppConfig, mm_model::runtime::config::ConfigError> 
         storage: StorageConfig {
             root: root.clone(),
             flush_every: 10,
-            partition_duration: Duration::from_secs(60 * 60),
         },
         training: TrainingConfig {
             horizon_ns: 60_000_000_000,

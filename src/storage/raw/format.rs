@@ -218,6 +218,21 @@ impl BookLogWriter {
         }
         Ok(())
     }
+
+    /// Flushes buffered records. The partition stays open.
+    pub fn flush(&mut self) -> Result<(), LogError> {
+        self.file.flush()?;
+        self.pending = 0;
+        Ok(())
+    }
+
+    /// Flushes and syncs, then drops the writer.
+    pub fn close(mut self) -> Result<(), LogError> {
+        self.file.flush()?;
+        self.file.sync_data()?;
+        self.pending = 0;
+        Ok(())
+    }
 }
 
 impl Drop for BookLogWriter {

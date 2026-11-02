@@ -31,6 +31,9 @@ pub struct ModelArtifact {
     pub example_count: u64,
     #[serde(default)]
     pub fill_count: u64,
+    /// Fills in the chronological training slice. Shadow release checks this, not the total.
+    #[serde(default)]
+    pub train_fill_count: u64,
     #[serde(default)]
     pub label_provenance: String,
     #[serde(default)]
@@ -39,6 +42,12 @@ pub struct ModelArtifact {
     pub window_to_ns: i64,
     #[serde(default)]
     pub dataset_id: String,
+    /// `published_for_shadow` is the only state a shadow run will load.
+    /// An empty or older value is refused. This is not a trading approval.
+    #[serde(default)]
+    pub model_state: String,
+    #[serde(default)]
+    pub validation_note: String,
 }
 
 impl ModelArtifact {
@@ -59,11 +68,34 @@ impl ModelArtifact {
             pnl_weights: pnl.weights().to_vec(),
             example_count: 0,
             fill_count: 0,
+            train_fill_count: 0,
             label_provenance: String::new(),
             window_from_ns: 0,
             window_to_ns: 0,
             dataset_id: String::new(),
+            model_state: String::new(),
+            validation_note: String::new(),
         }
+    }
+
+    /// Refuses a file that is not an observed model released for shadow experiments.
+    pub fn validate_for_shadow(
+        &self,
+        method: FairValueMethod,
+        horizon_ns: i64,
+    ) -> Result<(), ArtifactError> {
+        self.validate_for_run(method)?;
+        self.validate_horizon(horizon_ns)?;
+        if self.model_state != "published_for_shadow" {
+            return Err(ArtifactError::State);
+        }
+        if self.label_provenance != "observed" {
+            return Err(ArtifactError::Provenance);
+        }
+        if self.example_count < 20 || self.train_fill_count < 5 {
+            return Err(ArtifactError::Evidence);
+        }
+        Ok(())
     }
 
     pub fn validate_for_run(&self, method: FairValueMethod) -> Result<(), ArtifactError> {
@@ -114,11 +146,28 @@ impl ModelArtifact {
     }
 
     pub fn write_json(&self, path: &Path) -> Result<(), ArtifactError> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|_| ArtifactError::Io)?;
+            }
+        }
+        let tmp = path.with_extension("json.tmp");
         let text = serde_json::to_string_pretty(self).map_err(|_| ArtifactError::Json)?;
-        fs::write(path, text).map_err(|_| ArtifactError::Io)
+        {
+            let mut file = fs::File::create(&tmp).map_err(|_| ArtifactError::Io)?;
+            use std::io::Write;
+            file.write_all(text.as_bytes())
+                .map_err(|_| ArtifactError::Io)?;
+            file.sync_all().map_err(|_| ArtifactError::Io)?;
+        }
+        fs::rename(&tmp, path).map_err(|_| ArtifactError::Io)
     }
 
     pub fn read_json(path: &Path) -> Result<Self, ArtifactError> {
+        let meta = fs::metadata(path).map_err(|_| ArtifactError::Io)?;
+        if meta.len() > 1_048_576 {
+            return Err(ArtifactError::Io);
+        }
         let text = fs::read_to_string(path).map_err(|_| ArtifactError::Io)?;
         serde_json::from_str(&text).map_err(|_| ArtifactError::Json)
     }
@@ -148,6 +197,9 @@ pub enum ArtifactError {
     Weights,
     Json,
     Io,
+    State,
+    Provenance,
+    Evidence,
 }
 
 impl fmt::Display for ArtifactError {
@@ -160,6 +212,9 @@ impl fmt::Display for ArtifactError {
             Self::Weights => "model weights are missing, the wrong length, or not finite",
             Self::Json => "model artifact is not valid JSON",
             Self::Io => "model artifact could not be read or written",
+            Self::State => "model artifact is not released for shadow experiments",
+            Self::Provenance => "shadow loading requires observed fill labels",
+            Self::Evidence => "model artifact does not record enough training evidence",
         };
         f.write_str(message)
     }

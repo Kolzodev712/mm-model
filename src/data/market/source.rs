@@ -12,6 +12,11 @@ pub trait BookSource {
 
     /// Next book, or `None` when the source is finished.
     fn next_book(&mut self) -> Result<Option<BookRecord>, Self::Error>;
+
+    /// True when `err` means "no frame yet" and the caller should poll again.
+    fn is_idle(&self, _err: &Self::Error) -> bool {
+        false
+    }
 }
 
 /// In-memory source for tests. No sockets and no sleeps.

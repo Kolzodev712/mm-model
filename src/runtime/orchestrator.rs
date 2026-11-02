@@ -1,14 +1,15 @@
 //! Lifecycle only: rotate raw partitions, publish Parquet, maybe train.
 //!
-//! This reference orchestrator is sequential. Conversion of a closed hour
-//! finishes before the next book is read, and training runs on that same
-//! thread. The collector loop therefore pauses during those steps. The steps
-//! stay separate functions so a later worker split does not move the math.
+//! The collector thread only appends MMBK. A closed hour is sent on a bounded
+//! channel to one worker, which converts and may train. If that channel is
+//! full, collection stops with an error instead of dropping books. Shutdown
+//! flushes the open hour and leaves it open.
 
 use crate::data::market::source::BookSource;
 use crate::data::training::dataset::QuoteEvent;
 use crate::domain::book::BookRecord;
 use crate::model::fair_value::FairValueMethod;
+use crate::runtime::clock::Clock;
 use crate::runtime::collector::{CollectError, Collector};
 use crate::runtime::config::{AppConfig, RunMode, TrainingTrigger};
 use crate::runtime::converter::{publish_partition, ConvertError};
@@ -24,18 +25,11 @@ macro_rules! runtime_info {
     }};
 }
 
-/// Lifecycle signals between collection, conversion, and training.
-///
-/// There is no event bus. The orchestrator records these as it runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeEvent {
-    PartitionClosed(PartitionId),
-    PartitionPublished(PartitionId),
-    PartitionFailed(PartitionId),
-    TrainingCompleted(String),
-    TrainingRejected(String),
-    TrainingSkipped,
-    TrainingFailed,
+macro_rules! runtime_error {
+    ($($arg:tt)*) => {{
+        #[cfg(feature = "observe")]
+        tracing::error!($($arg)*);
+    }};
 }
 
 #[derive(Debug)]
@@ -45,7 +39,11 @@ pub enum OrchestratorError {
     Train(TrainFailure),
     Catalog(ManifestError),
     Source(String),
-    Config,
+    /// Conversion is more than two hours behind. Books already written are kept.
+    Backlog,
+    Worker,
+    /// CollectAndTrain was started without quote or fill records.
+    NoLabels,
 }
 
 impl std::fmt::Display for OrchestratorError {
@@ -56,7 +54,13 @@ impl std::fmt::Display for OrchestratorError {
             Self::Train(err) => write!(f, "{err}"),
             Self::Catalog(err) => write!(f, "{err}"),
             Self::Source(err) => write!(f, "{err}"),
-            Self::Config => f.write_str("this build only supports one-hour UTC partitions"),
+            Self::Backlog => {
+                f.write_str("conversion is behind; collection stopped instead of dropping books")
+            }
+            Self::Worker => f.write_str("conversion worker stopped unexpectedly"),
+            Self::NoLabels => f.write_str(
+                "CollectAndTrain needs quote and fill records; public books do not provide them",
+            ),
         }
     }
 }
@@ -98,9 +102,6 @@ where
     S: BookSource,
     S::Error: std::fmt::Display,
 {
-    if config.storage.partition_duration != std::time::Duration::from_secs(60 * 60) {
-        return Err(OrchestratorError::Config);
-    }
     match config.mode {
         RunMode::Train => {
             let catalog = Catalog::open(&config.storage.root)?;
@@ -123,6 +124,9 @@ where
     S: BookSource,
     S::Error: std::fmt::Display,
 {
+    if config.mode == RunMode::CollectAndTrain && quotes.is_empty() {
+        return Err(OrchestratorError::NoLabels);
+    }
     let started = std::time::Instant::now();
     let catalog = Catalog::open(&config.storage.root)?;
     let mut collector = Collector::new(
@@ -131,9 +135,21 @@ where
         config.market.symbol.as_str(),
         config.storage.flush_every,
     );
-    let mut since_train = 0u32;
-    let mut trained = Vec::new();
-    let mut events = Vec::new();
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    let worker_config = config.clone();
+    let worker_quotes = quotes.to_vec();
+    let worker_catalog = collector.shared_catalog();
+    let worker =
+        std::thread::spawn(move || worker_loop(worker_catalog, worker_config, worker_quotes, rx));
+    if let Ok(now_ns) = crate::runtime::clock::SystemClock.unix_nanos() {
+        for id in seal_stale_partitions(collector.catalog_mutex(), now_ns) {
+            if tx.send(id).is_err() {
+                let _ = worker.join();
+                return Err(OrchestratorError::Worker);
+            }
+        }
+    }
+    let mut failed = None;
     loop {
         if should_stop()
             || config
@@ -142,93 +158,140 @@ where
         {
             break;
         }
-        let book = source
-            .next_book()
-            .map_err(|err| OrchestratorError::Source(err.to_string()))?;
+        let book = match source.next_book() {
+            Ok(book) => book,
+            Err(err) if source.is_idle(&err) => continue,
+            Err(err) => {
+                failed = Some(OrchestratorError::Source(err.to_string()));
+                break;
+            }
+        };
         let Some(book) = book else { break };
-        if let Some(closed) = collector.push(&book)? {
-            since_train = after_close(
-                config,
-                collector.catalog_mut(),
-                &closed,
-                since_train,
-                quotes,
-                &mut trained,
-                &mut events,
-            )?;
+        match collector.push(&book) {
+            Ok(Some(closed)) => {
+                if tx.try_send(closed).is_err() {
+                    failed = Some(OrchestratorError::Backlog);
+                    break;
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                failed = Some(err.into());
+                break;
+            }
         }
     }
-    if let Some(closed) = collector.finish()? {
-        let _ = after_close(
-            config,
-            collector.catalog_mut(),
-            &closed,
-            since_train,
-            quotes,
-            &mut trained,
-            &mut events,
-        )?;
+    if let Err(err) = collector.finish() {
+        failed.get_or_insert(err.into());
     }
-    runtime_info!(lifecycle_events = events.len(), "collection finished");
-    Ok(trained)
+    drop(tx);
+    let trained = match worker.join() {
+        Ok(result) => result?,
+        Err(_) => return Err(OrchestratorError::Worker),
+    };
+    runtime_info!(training_results = trained.len(), "collection finished");
+    match failed {
+        Some(err) => Err(err),
+        None => Ok(trained),
+    }
 }
 
-fn after_close(
-    config: &AppConfig,
-    catalog: &mut Catalog,
-    closed: &PartitionId,
-    mut since_train: u32,
-    quotes: &[QuoteEvent],
-    trained: &mut Vec<TrainOutcome>,
-    events: &mut Vec<RuntimeEvent>,
-) -> Result<u32, OrchestratorError> {
-    events.push(RuntimeEvent::PartitionClosed(closed.clone()));
-    match publish_partition(catalog, closed, ParquetConfig::default()) {
-        Ok(()) => {
-            events.push(RuntimeEvent::PartitionPublished(closed.clone()));
-            since_train += 1;
+fn seal_stale_partitions(catalog: &std::sync::Mutex<Catalog>, now_ns: i64) -> Vec<PartitionId> {
+    let mut guard = catalog.lock().unwrap_or_else(|err| err.into_inner());
+    let mut sealed = Vec::new();
+    let snapshot: Vec<_> = guard.records().to_vec();
+    for row in snapshot {
+        let retry = matches!(
+            row.state,
+            crate::storage::partition::PartitionState::Closed
+                | crate::storage::partition::PartitionState::Validated
+                | crate::storage::partition::PartitionState::Converted
+        );
+        let stale_open = row.state == crate::storage::partition::PartitionState::Open
+            && crate::storage::partition::PartitionId::from_receive_ns(
+                &row.id.exchange,
+                &row.id.symbol,
+                now_ns,
+            )
+            .ok()
+            .is_some_and(|current| {
+                (row.id.day.as_str(), row.id.hour) < (current.day.as_str(), current.hour)
+            });
+        if retry {
+            sealed.push(row.id);
+            continue;
         }
-        Err(
-            err @ (ConvertError::StillOpen
-            | ConvertError::Ambiguous
-            | ConvertError::Missing
-            | ConvertError::Manifest(_)),
-        ) => return Err(err.into()),
-        Err(err) => {
-            events.push(RuntimeEvent::PartitionFailed(closed.clone()));
-            let _ = err;
-            return Ok(since_train);
+        if !stale_open {
+            continue;
         }
-    }
-    if config.mode == RunMode::Collect {
-        return Ok(since_train);
-    }
-    let due = match config.training.trigger {
-        TrainingTrigger::EveryPublishedPartitions(n) => since_train >= n && n > 0,
-    };
-    if due {
-        match train_from(config, catalog, quotes) {
-            Ok(TrainOutcome::Published { dataset_id, state }) => {
-                events.push(RuntimeEvent::TrainingCompleted(dataset_id.clone()));
-                trained.push(TrainOutcome::Published { dataset_id, state });
-                since_train = 0;
-            }
-            Ok(TrainOutcome::Rejected { reason, state }) => {
-                events.push(RuntimeEvent::TrainingRejected(reason.clone()));
-                trained.push(TrainOutcome::Rejected { reason, state });
-                since_train = 0;
-            }
-            Ok(TrainOutcome::SkippedNoLabels) => {
-                events.push(RuntimeEvent::TrainingSkipped);
-                trained.push(TrainOutcome::SkippedNoLabels);
-                since_train = 0;
-            }
-            Err(_) => {
-                events.push(RuntimeEvent::TrainingFailed);
+        let path = row.id.raw_path(guard.root());
+        let count = std::fs::File::open(&path)
+            .ok()
+            .and_then(|mut file| crate::storage::raw::read_book_log(&mut file).ok())
+            .map(|books| books.len() as u64);
+        let Some(count) = count else {
+            continue;
+        };
+        if let Some(existing) = guard.get(&row.id).cloned() {
+            let mut existing = existing;
+            existing.state = crate::storage::partition::PartitionState::Closed;
+            existing.raw_count = count;
+            existing.raw_path = path.display().to_string();
+            let id = existing.id.clone();
+            guard.upsert(existing);
+            if guard.save().is_ok() {
+                sealed.push(id);
             }
         }
     }
-    Ok(since_train)
+    sealed
+}
+
+fn worker_loop(
+    catalog: std::sync::Arc<std::sync::Mutex<Catalog>>,
+    config: AppConfig,
+    quotes: Vec<QuoteEvent>,
+    rx: std::sync::mpsc::Receiver<PartitionId>,
+) -> Result<Vec<TrainOutcome>, OrchestratorError> {
+    let mut trained = Vec::new();
+    let mut since_train = 0u32;
+    while let Ok(closed) = rx.recv() {
+        match publish_partition(&catalog, &closed, ParquetConfig::default()) {
+            Ok(()) => since_train += 1,
+            Err(ConvertError::StillOpen | ConvertError::Ambiguous | ConvertError::Missing) => {
+                return Err(ConvertError::Ambiguous.into());
+            }
+            Err(ConvertError::Manifest(err)) => return Err(err.into()),
+            Err(err) => {
+                runtime_error!(error = %err, "partition conversion failed");
+                continue;
+            }
+        }
+        if config.mode != RunMode::CollectAndTrain {
+            continue;
+        }
+        let due = match config.training.trigger {
+            TrainingTrigger::EveryPublishedPartitions(n) => since_train >= n && n > 0,
+        };
+        if !due {
+            continue;
+        }
+        let snapshot = {
+            let guard = catalog.lock().unwrap_or_else(|err| err.into_inner());
+            guard.clone()
+        };
+        match train_from(&config, &snapshot, &quotes) {
+            Ok(outcome) => {
+                runtime_info!("training cycle finished");
+                trained.push(outcome);
+                since_train = 0;
+            }
+            Err(err) => {
+                runtime_error!(error = %err, "training failed; previous artifact kept");
+            }
+        }
+    }
+    Ok(trained)
 }
 
 fn train_from(
@@ -353,7 +416,6 @@ mod tests {
             storage: StorageConfig {
                 root: root.to_path_buf(),
                 flush_every: 1,
-                partition_duration: std::time::Duration::from_secs(60 * 60),
             },
             training: TrainingConfig {
                 horizon_ns: 500,
@@ -406,19 +468,20 @@ mod tests {
         .unwrap();
         assert!(matches!(
             outcomes.first(),
-            Some(TrainOutcome::Published { .. })
+            Some(TrainOutcome::InsufficientData { .. })
         ));
         let catalog = Catalog::open(&root).unwrap();
         let published = catalog.published_overlapping("binance", "BTCUSDT", 0, i64::MAX / 4);
-        assert_eq!(published.len(), 2);
+        assert_eq!(published.len(), 1);
         assert!(published
             .iter()
             .all(|row| row.state == PartitionState::Published));
         assert!(published
             .iter()
             .all(|row| { row.parquet_path.as_deref().unwrap().ends_with(".parquet") }));
+        let again_catalog = std::sync::Mutex::new(Catalog::open(&root).unwrap());
         crate::runtime::converter::publish_partition(
-            &mut Catalog::open(&root).unwrap(),
+            &again_catalog,
             &published[0].id,
             crate::storage::parquet::ParquetConfig::default(),
         )
@@ -428,7 +491,7 @@ mod tests {
             again
                 .published_overlapping("binance", "BTCUSDT", 0, i64::MAX / 4)
                 .len(),
-            2
+            1
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -451,7 +514,7 @@ mod tests {
         )
         .unwrap();
         let err = crate::runtime::converter::publish_partition(
-            collector.catalog_mut(),
+            collector.catalog_mutex(),
             &id,
             crate::storage::parquet::ParquetConfig::default(),
         )
@@ -461,7 +524,9 @@ mod tests {
             crate::runtime::converter::ConvertError::StillOpen
         ));
         assert!(collector
-            .catalog_mut()
+            .catalog_mutex()
+            .lock()
+            .unwrap()
             .published_overlapping("binance", "BTCUSDT", 0, i64::MAX / 4)
             .is_empty());
         let _ = std::fs::remove_dir_all(&root);
@@ -489,6 +554,47 @@ mod tests {
     }
 
     #[test]
+    fn collect_and_train_without_labels_is_an_error() {
+        let root = temp();
+        let err = run_books(&config(&root, RunMode::CollectAndTrain), &[], &[]).unwrap_err();
+        assert!(matches!(err, OrchestratorError::NoLabels));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn more_than_two_stale_partitions_are_converted() {
+        let root = temp();
+        let start = 1_700_000_000_000_000_000i64;
+        let mut catalog = Catalog::open(&root).unwrap();
+        for step in 0..3 {
+            let ns = start + step * 3_600_000_000_000;
+            let sample = book(ns, 99.9, 100.1);
+            let id =
+                crate::storage::partition::partition_for("binance", "BTCUSDT", &sample).unwrap();
+            let path = id.raw_path(&root);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut writer = crate::storage::raw::BookLogWriter::open(&path, 1).unwrap();
+            writer.write(&sample).unwrap();
+            writer.close().unwrap();
+            let mut row = crate::storage::partition::PartitionRecord::open(id, &root, ns);
+            row.state = PartitionState::Closed;
+            row.raw_count = 1;
+            row.end_ns = ns;
+            catalog.upsert(row);
+        }
+        catalog.save().unwrap();
+        run_books(&config(&root, RunMode::Collect), &[], &[]).unwrap();
+        let catalog = Catalog::open(&root).unwrap();
+        assert_eq!(
+            catalog
+                .published_overlapping("binance", "BTCUSDT", 0, i64::MAX / 4)
+                .len(),
+            3
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn conversion_failure_keeps_the_partition_unpublished() {
         let root = temp();
         let hour = 1_793_624_400_000_000_000i64;
@@ -499,22 +605,30 @@ mod tests {
             1,
         );
         collector.push(&book(hour, 99.9, 100.1)).unwrap();
-        let id = collector.finish().unwrap().unwrap();
+        let id = collector.seal().unwrap().unwrap();
         let raw = id.raw_path(&root);
         std::fs::remove_file(&raw).unwrap();
         let err = crate::runtime::converter::publish_partition(
-            collector.catalog_mut(),
+            collector.catalog_mutex(),
             &id,
             crate::storage::parquet::ParquetConfig::default(),
         )
         .unwrap_err();
         assert!(matches!(err, crate::runtime::converter::ConvertError::Raw));
         assert_eq!(
-            collector.catalog_mut().get(&id).unwrap().state,
+            collector
+                .catalog_mutex()
+                .lock()
+                .unwrap()
+                .get(&id)
+                .unwrap()
+                .state,
             PartitionState::Failed
         );
         assert!(collector
-            .catalog_mut()
+            .catalog_mutex()
+            .lock()
+            .unwrap()
             .published_overlapping("binance", "BTCUSDT", 0, i64::MAX / 4)
             .is_empty());
         let _ = std::fs::remove_dir_all(&root);
@@ -547,13 +661,16 @@ mod tests {
             &[quote],
         )
         .unwrap();
-        assert!(outcomes.is_empty());
+        assert!(matches!(
+            outcomes.first(),
+            Some(TrainOutcome::InsufficientData { .. })
+        ));
         let catalog = Catalog::open(&root).unwrap();
         assert_eq!(
             catalog
                 .published_overlapping("binance", "BTCUSDT", 0, i64::MAX / 4)
                 .len(),
-            2
+            1
         );
         assert_eq!(std::fs::read(&blocker).unwrap(), b"file");
         let _ = std::fs::remove_dir_all(&root);

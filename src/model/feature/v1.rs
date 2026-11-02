@@ -19,8 +19,16 @@ use std::fmt;
 
 use crate::domain::market::{CandidateQuote, MarketState};
 
-/// Schema version stored in model artifacts. Version 1 is the five-feature row.
-pub const FEATURE_SCHEMA_V1: u32 = 1;
+/// Schema version stored in model artifacts.
+///
+/// Version 2 keeps the five ratios and expresses the three price ratios in
+/// basis points (`ratio * 10_000`). Version 1 weights are not compatible:
+/// those ratios sit near `1e-4`, and the reference gradient step cannot move
+/// them. A model file from version 1 is rejected.
+pub const FEATURE_SCHEMA_V1: u32 = 2;
+
+/// Multiplier applied to the three price ratios so a basis point is about 1.
+pub const PRICE_RATIO_SCALE: f64 = 10_000.0;
 
 /// Number of features in [`FEATURE_SCHEMA_V1`].
 pub const FEATURE_COUNT: usize = 5;
@@ -38,11 +46,14 @@ pub const QUOTE_DISTANCE_FROM_FAIR: usize = 0;
 /// A crossed book never reaches this function: the estimator rejects it.
 pub const EXCHANGE_SPREAD: usize = 1;
 
-/// `(quote_price - best_bid_price) / fair_value`. Dimensionless.
+/// `(quote_price - best_bid_price) / fair_value`, then scaled to basis points.
 ///
 /// Buy-side distance from the current best bid. Zero joins the touch.
-/// Distance to the ask is omitted because it is determined by this value and
-/// the spread. Source: candidate price, best bid, and fair value.
+/// Under midpoint this is an exact linear combination of distance-from-fair
+/// and spread. Under microprice it is determined by those two features and
+/// the quantity imbalance. The weight on this coordinate is not separately
+/// identified. It stays in the row so older comparisons remain explicit.
+/// Source: candidate price, best bid, and fair value.
 pub const QUOTE_DISTANCE_FROM_BEST_BID: usize = 2;
 
 /// `(bid_qty - ask_qty) / (bid_qty + ask_qty)`. Dimensionless, in `[-1, 1]`
@@ -120,9 +131,9 @@ pub fn extract_features(
     let imbalance = (bid_qty - ask_qty) / depth;
     let relative_quantity = quote.quantity() / depth;
     FeatureVector::new([
-        (fair - quote.price()) / fair,
-        (market.best_ask_price() - market.best_bid_price()) / fair,
-        (quote.price() - market.best_bid_price()) / fair,
+        (fair - quote.price()) / fair * PRICE_RATIO_SCALE,
+        (market.best_ask_price() - market.best_bid_price()) / fair * PRICE_RATIO_SCALE,
+        (quote.price() - market.best_bid_price()) / fair * PRICE_RATIO_SCALE,
         imbalance,
         relative_quantity,
     ])
@@ -169,12 +180,21 @@ mod tests {
         let values = features.as_array();
         assert_eq!(values.len(), FEATURE_COUNT);
         assert_eq!(FEATURE_NAMES.len(), FEATURE_COUNT);
-        assert!((values[QUOTE_DISTANCE_FROM_FAIR] - ((fair - 99.8) / fair)).abs() < 1e-12);
-        assert!((values[EXCHANGE_SPREAD] - ((100.1 - 99.9) / fair)).abs() < 1e-12);
-        assert!((values[QUOTE_DISTANCE_FROM_BEST_BID] - ((99.8 - 99.9) / fair)).abs() < 1e-12);
+        assert!(
+            (values[QUOTE_DISTANCE_FROM_FAIR] - ((fair - 99.8) / fair * PRICE_RATIO_SCALE)).abs()
+                < 1e-9
+        );
+        assert!(
+            (values[EXCHANGE_SPREAD] - ((100.1 - 99.9) / fair * PRICE_RATIO_SCALE)).abs() < 1e-9
+        );
+        assert!(
+            (values[QUOTE_DISTANCE_FROM_BEST_BID] - ((99.8 - 99.9) / fair * PRICE_RATIO_SCALE))
+                .abs()
+                < 1e-9
+        );
         assert!((values[TOP_QUANTITY_IMBALANCE] - (1.0 / 3.0)).abs() < 1e-12);
         assert!((values[RELATIVE_CANDIDATE_QUANTITY] - (1.0 / 3.0)).abs() < 1e-12);
-        assert_eq!(FEATURE_SCHEMA_V1, 1);
+        assert_eq!(FEATURE_SCHEMA_V1, 2);
         assert!(values.iter().all(|value| value.is_finite()));
     }
 
