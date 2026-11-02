@@ -1,5 +1,10 @@
 //! Recorded quoting attempts and their mark-to-fair-value P&L.
 //!
+//! This is the legacy historical baseline. [`HistoricalObservation`] stores a
+//! horizon reference price that the caller already has. The learned dataset
+//! builder does not use that field: it estimates both the decision-time and
+//! horizon prices from recorded books.
+//!
 //! A filled buy is marked against the fair value at a fixed horizon:
 //!
 //! ```text
@@ -166,16 +171,31 @@ impl HistoricalObservation {
 
     /// Mark-to-fair-value P&L of this attempt.
     ///
-    /// Filled buys use `(fair_value - execution_price) * quantity - fees`.
-    /// Unfilled attempts return 0.
+    /// Filled buys use [`mark_to_fair_pnl`]. Unfilled attempts return 0.
     pub fn pnl(&self) -> f64 {
         match self.outcome {
             FillOutcome::Unfilled => 0.0,
-            FillOutcome::Filled { execution_price } => {
-                (self.fair_value_at_horizon - execution_price) * self.quantity - self.fees
-            }
+            FillOutcome::Filled { execution_price } => mark_to_fair_pnl(
+                self.fair_value_at_horizon,
+                execution_price,
+                self.quantity,
+                self.fees,
+            ),
         }
     }
+}
+
+/// Mark-to-fair-value P&L of one filled buy.
+///
+/// `(fair_value_at_horizon - execution_price) * quantity - fees`.
+#[must_use]
+pub fn mark_to_fair_pnl(
+    fair_value_at_horizon: f64,
+    execution_price: f64,
+    quantity: f64,
+    fees: f64,
+) -> f64 {
+    (fair_value_at_horizon - execution_price) * quantity - fees
 }
 
 /// Input that cannot represent a quoting observation under the baseline rules.

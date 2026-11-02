@@ -4,8 +4,12 @@
 //! value is strictly greater than that. Nothing here applies a risk penalty,
 //! confidence interval, or inventory adjustment.
 //!
-//! Expected value is [`StrategyEvaluation::expected_value`], the fill
-//! probability times average P&L if filled.
+//! Expected value is fill probability times conditional P&L. For historical
+//! strategies that value is [`StrategyEvaluation::expected_value`]. Learned
+//! scores use the same comparison through [`select_action`].
+//!
+//! The result is an offline or shadow choice. It is not an instruction to
+//! send an order.
 
 use std::cmp::Ordering;
 
@@ -44,6 +48,15 @@ impl QuoteDecision {
     }
 }
 
+/// One candidate action and its expected value per attempt.
+///
+/// `strategy_id` is borrowed. Selection clones only the winning id.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ActionScore<'a> {
+    pub strategy_id: &'a StrategyId,
+    pub expected_value: f64,
+}
+
 /// Selects the action with the highest expected value.
 ///
 /// When no strategy has expected value strictly above 0, the result is
@@ -53,22 +66,41 @@ impl QuoteDecision {
 /// If several strategies share the best expected value above 0, the
 /// lexicographically smallest [`StrategyId`] wins so the choice is stable.
 /// Non-finite expected values are ignored.
+#[must_use]
 pub fn select_quote(evaluations: &[StrategyEvaluation]) -> QuoteDecision {
-    let best = evaluations
-        .iter()
-        .filter(|evaluation| evaluation.expected_value.is_finite())
-        .reduce(
-            |best, candidate| match candidate.expected_value.total_cmp(&best.expected_value) {
-                Ordering::Greater => candidate,
-                Ordering::Equal if candidate.strategy_id < best.strategy_id => candidate,
-                _ => best,
-            },
-        );
+    select_ranked(
+        evaluations
+            .iter()
+            .map(|evaluation| (&evaluation.strategy_id, evaluation.expected_value)),
+    )
+}
+
+/// Applies [`select_quote`]'s rule to expected values from any source.
+///
+/// Historical aggregation and learned models both end here. `NoQuote` has
+/// expected value 0. This does not apply a risk check or send an order.
+#[must_use]
+pub fn select_action(actions: &[ActionScore<'_>]) -> QuoteDecision {
+    select_ranked(
+        actions
+            .iter()
+            .map(|action| (action.strategy_id, action.expected_value)),
+    )
+}
+
+fn select_ranked<'a>(candidates: impl Iterator<Item = (&'a StrategyId, f64)>) -> QuoteDecision {
+    let best = candidates
+        .filter(|(_, expected_value)| expected_value.is_finite())
+        .reduce(|best, candidate| match candidate.1.total_cmp(&best.1) {
+            Ordering::Greater => candidate,
+            Ordering::Equal if candidate.0 < best.0 => candidate,
+            _ => best,
+        });
 
     match best {
-        Some(evaluation) if evaluation.expected_value > 0.0 => QuoteDecision::Quote {
-            strategy_id: evaluation.strategy_id.clone(),
-            expected_value: evaluation.expected_value,
+        Some((strategy_id, expected_value)) if expected_value > 0.0 => QuoteDecision::Quote {
+            strategy_id: strategy_id.clone(),
+            expected_value,
         },
         _ => QuoteDecision::NoQuote,
     }
@@ -93,6 +125,19 @@ mod tests {
             0.0,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn learned_scores_use_the_same_rule() {
+        let evaluations = evaluate_strategies(&test_fixture::example_dataset());
+        let scores: Vec<ActionScore<'_>> = evaluations
+            .iter()
+            .map(|evaluation| ActionScore {
+                strategy_id: &evaluation.strategy_id,
+                expected_value: evaluation.expected_value,
+            })
+            .collect();
+        assert_eq!(select_action(&scores), select_quote(&evaluations));
     }
 
     #[test]

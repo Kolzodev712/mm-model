@@ -12,6 +12,9 @@
 //!
 //! [`crate::selection`] consumes the resulting expected value and does not
 //! care whether it came from these counts or from a model.
+//!
+//! Learned fill and conditional-P&L models live beside this module. They do
+//! not replace these historical counts.
 
 use std::collections::BTreeMap;
 
